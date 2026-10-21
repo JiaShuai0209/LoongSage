@@ -47,5 +47,20 @@ RUN cd /sgl-workspace/Megatron-LM && git apply /tmp/patch/dsv41/megatron-core.pa
 RUN cd /sgl-workspace/Megatron-Bridge && git apply /tmp/patch/dsv41/megatron-bridge.patch
 RUN rm -rf /tmp/patch
 
+# --enable-nvidia-megakernel for any plugin (backported from SGLang #44945); model-agnostic,
+# the kernels come from plugin packages (e.g. tilert)
+COPY patch/megakernels /tmp/megakernels
+RUN cd /sgl-workspace/sglang && git apply /tmp/megakernels/sglang.patch && rm -rf /tmp/megakernels
+
+# libtilert_qwen36 kernels and their SGLang plugin (tilert_sglang), for Qwen3.6-35B-A3B rollout decode on
+# --enable-nvidia-megakernel. tilert-kernels is not public: pass a checkout of it as an extra build context, e.g.
+#   docker build -f docker/Dockerfile --build-context tilert=/path/to/tilert-kernels -t <image> docker
+# libtilert_qwen36.so is one fat binary for B200 (sm_100f) and H100 / H20 (sm_90a), built with the image's CUDA 13.
+COPY --from=tilert . /sgl-workspace/tilert-kernels
+RUN cd /sgl-workspace/tilert-kernels \
+ && TILERT_TOOLCHAIN=/usr/local/cuda TILERT_CUDA_RT_LIB=/usr/local/cuda/lib64 ./build.sh qwen36 \
+ && pip install --no-deps -e python
+ENV TILERT_QWEN36_LIB=/sgl-workspace/tilert-kernels/build/lib/libtilert_qwen36.so
+
 # loongsage
 RUN git clone https://github.com/baidu-baige/LoongSage.git && cd LoongSage && pip install --no-deps --no-build-isolation -e .

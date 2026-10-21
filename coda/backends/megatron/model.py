@@ -114,10 +114,33 @@ def _collect_loss_metrics(
 # Routing Replay Helpers
 # ════════════════════════════════════════════════════════════════════════
 
+def _chunk_router_replays(model_chunk: torch.nn.Module) -> tuple[list[RouterReplay], list[RouterReplay]]:
+    """The chunk's RouterReplay objects as (decoder MoE layers in layer order, the rest, e.g. MTP).
+
+    Walks the module tree rather than RouterReplay.global_router_replay_instances: that registry
+    keeps every router ever built, including ones no longer in the model (Qwen3-VL's GPTModel.__init__
+    builds a stock decoder that the subclass then replaces), so its positions do not line up with layers.
+    """
+    decoder, other = [], []
+    for name, module in model_chunk.named_modules():
+        replay = getattr(module, "router_replay", None)
+        if isinstance(replay, RouterReplay):
+            (other if "mtp" in name.split(".") else decoder).append(replay)
+    return decoder, other
+
+
+def set_routing_replay_action(model: Sequence, action: RouterReplayAction):
+    """Replay on the decoder routers; the others (MTP) have no rollout routing and route themselves."""
+    RouterReplay.set_global_router_replay_action(action)
+    for model_chunk in model:
+        for replay in _chunk_router_replays(model_chunk)[1]:
+            replay.clear_router_replay_action()
+
+
 def setup_routing_replay(config: DictConfig, batch: dict, model_chunk: torch.nn.Module, model: Sequence):
     """
     Extract routing data from batch and setup Megatron RouterReplay for the current model chunk.
-    Only sets replay data for the RouterReplay instances belonging to the current model_chunk's vp_stage. 
+    Only sets replay data for the RouterReplay instances belonging to the current model_chunk's vp_stage.
     """
     model_config = get_model_config(model_chunk)
     rollout_routed_experts = [
@@ -139,27 +162,20 @@ def setup_routing_replay(config: DictConfig, batch: dict, model_chunk: torch.nn.
             return model_config.moe_layer_freq[layer_id] != 0
         return True
 
-    # Compute instance offset: count MoE layers in all preceding vp stages
-    instance_offset = 0
-    for vp in range(vp_stage):
-        num_layers = get_num_layers_to_build(model_config, vp_stage=vp)
-        layer_offset = get_transformer_layer_offset(model_config, vp_stage=vp)
-        for layer_id in range(layer_offset, layer_offset + num_layers):
-            if _is_moe_layer(layer_id):
-                instance_offset += 1
-
-    # Set target indices only for this vp_stage's MoE layers
+    # Set target indices on this vp_stage's MoE layers, which its decoder holds in layer order
     num_layers = get_num_layers_to_build(model_config, vp_stage=vp_stage)
     layer_offset = get_transformer_layer_offset(model_config, vp_stage=vp_stage)
-    instances = RouterReplay.global_router_replay_instances
-    idx = instance_offset
-    for layer_id in range(layer_offset, layer_offset + num_layers):
-        if not _is_moe_layer(layer_id):
-            continue
-        instances[idx].set_target_indices(packed_experts[:, layer_id])
-        idx += 1
+    moe_layer_ids = [i for i in range(layer_offset, layer_offset + num_layers) if _is_moe_layer(i)]
+    replays = _chunk_router_replays(model_chunk)[0]
+    if len(replays) != len(moe_layer_ids):
+        raise RuntimeError(
+            f"routing replay: vp_stage {vp_stage} has {len(replays)} decoder routers but "
+            f"{len(moe_layer_ids)} MoE layers in [{layer_offset}, {layer_offset + num_layers})"
+        )
+    for replay, layer_id in zip(replays, moe_layer_ids):
+        replay.set_target_indices(packed_experts[:, layer_id])
 
-    RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+    set_routing_replay_action(model, RouterReplayAction.REPLAY_FORWARD)
 
 # ════════════════════════════════════════════════════════════════════════
 # MRoPE position ids
@@ -405,7 +421,7 @@ def train_minibatch(
             packed_seq_params=packed_seq_params,
         )
         if config.trainer.use_rollout_routing_replay:
-            RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_BACKWARD)
+            set_routing_replay_action(model, RouterReplayAction.REPLAY_BACKWARD)
 
         # 4. Loss callback
         return output, partial(loss_function, config, batch, packed_seq_params, gkd_policy)

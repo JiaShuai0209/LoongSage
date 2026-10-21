@@ -1,0 +1,1660 @@
+diff --git a/python/sglang/srt/arg_groups/fields/exec_.py b/python/sglang/srt/arg_groups/fields/exec_.py
+index 21afe7f02b..71e69cb147 100644
+--- a/python/sglang/srt/arg_groups/fields/exec_.py
++++ b/python/sglang/srt/arg_groups/fields/exec_.py
+@@ -143,6 +143,10 @@ class ExecKernel(msgspec.Struct):
+         Optional[bool],
+         "Enable Lean (Work-Centric) Attention decode kernel for long-context serving. When None (default), uses auto-gate that activates Lean for long contexts and falls back to standard kernel for short contexts. Set to True to force enable, False to force disable.",
+     ] = None
++    enable_nvidia_megakernel: A[
++        bool,
++        "Enable the NVIDIA megakernel registered by an installed sglang.srt.plugins plugin (e.g. sgl-nvidia-mega). Supported decode and verify steps use its fused kernels; other steps use the standard forward. An unsupported startup configuration raises an error listing the reasons. Experimental feature.",
++    ] = False
+     prefill_attention_backend: A[
+         Optional[str],
+         Arg(
+diff --git a/python/sglang/srt/arg_groups/pipeline.py b/python/sglang/srt/arg_groups/pipeline.py
+index 3963f548c1..cfa8d7f278 100644
+--- a/python/sglang/srt/arg_groups/pipeline.py
++++ b/python/sglang/srt/arg_groups/pipeline.py
+@@ -333,6 +333,11 @@ def run_resolution_pipeline(server_args: Any) -> None:
+     # Apply model-capability constraints after backend selection.
+     run_hook(handle_model_capability_adjustments, server_args)
+ 
++    # needs the resolved CUDA-graph, attention-backend and speculative settings
++    from sglang.srt.megakernels.guards import handle_nvidia_megakernel
++
++    run_hook(handle_nvidia_megakernel, server_args)
++
+     finalize_cuda_graph_prefill_max_context(server_args)
+ 
+     # Validate after all batch-size declarations are visible.
+diff --git a/python/sglang/srt/arg_groups/resolution_hooks.py b/python/sglang/srt/arg_groups/resolution_hooks.py
+index 9422d8025e..c05dc71dbb 100644
+--- a/python/sglang/srt/arg_groups/resolution_hooks.py
++++ b/python/sglang/srt/arg_groups/resolution_hooks.py
+@@ -91,6 +91,7 @@ _OVERRIDABLE_HOOKS: FrozenSet[str] = frozenset(
+         "handle_debug_utils",
+         "handle_other_validations",
+         "handle_model_capability_adjustments",
++        "handle_nvidia_megakernel",
+         "validate_deepep_v2_speculative_draft",
+         "validate_deepep_v2_dispatch_token_budget",
+     }
+diff --git a/python/sglang/srt/megakernels/__init__.py b/python/sglang/srt/megakernels/__init__.py
+new file mode 100644
+index 0000000000..c0ea4256c6
+--- /dev/null
++++ b/python/sglang/srt/megakernels/__init__.py
+@@ -0,0 +1,7 @@
++"""NVIDIA megakernels: whole-step dispatch for out-of-tree megakernel plugins.
++
++Plugins register specs through the sglang.srt.plugins entry point. With
++--enable-nvidia-megakernel the runtime validates the configuration, builds the
++spec after the model is prepared, and routes covered steps through it; other
++steps use the model forward.
++"""
+diff --git a/python/sglang/srt/megakernels/binding.py b/python/sglang/srt/megakernels/binding.py
+new file mode 100644
+index 0000000000..06c9981c44
+--- /dev/null
++++ b/python/sglang/srt/megakernels/binding.py
+@@ -0,0 +1,236 @@
++# SPDX-License-Identifier: Apache-2.0
++"""The data SGLang hands a megakernel's build, forward and draft entries.
++
++The one place a megakernel reads SGLang's runtime state: the KV pool, the attention
++metadata of the running forward, the linear-attention (GDN / Mamba) state of a
++hybrid model and the Engram tables. A spec's build gets a
++``MegakernelBinding`` as ``BuildContext.binding``; a covered forward gets the
++running forward's ``ForwardView`` as ``Step.view`` (a draft entry asks
++``binding.forward_view()``). Everything else a megakernel touches is the model it
++replaces, SGLang's kernel ops, and the reads listed below.
++"""
++
++from __future__ import annotations
++
++from typing import Any, Callable, Optional
++
++import torch
++
++# Called by a megakernel, tolerated until offered as data (its contract test pins
++# both lists).
++TOLERATED_CALLABLES = (
++    "ForwardView.attention",  # the attention backend's own forward
++    "ForwardView.store_cache",  # the KV write
++    "ForwardView.swa_out_cache_loc",
++    "ForwardView.low_ratio_sources",  # compressor / indexer inputs
++    "ForwardView.core_compressor",
++    "KvPoolView.set_swa_key_buffer_radix_fused_norm_rope",  # the fused SWA key write
++    "KvPoolView.pool",  # passed back to SGLang's own draft KV store only
++    "LinearStateView.track_states",  # the radix cache's decode state snapshot
++    "sglang.kernels.ops",  # SGLang's kernel ops
++    "the replaced model's modules, weights and quant methods",
++)
++# Written into SGLang's objects, tolerated until SGLang owns these buffers.
++TOLERATED_WRITES = (
++    "ForwardView.metadata.q_pad_buffer",
++    "ForwardView.metadata.low_ratio_req_indices",
++    "ForwardView.metadata.low_ratio_pos_i64",
++)
++# Read, tolerated: configuration, not runtime state.
++TOLERATED_READS = (
++    "runtime_context getters (get_parallel, get_exec, get_spec, get_platform)",
++    "capture-mode queries (get_is_capture_mode, is_in_breakable_cuda_graph)",
++    "MegakernelBinding.engram_host_table",  # the per-layer host table object
++)
++
++
++class KvPoolView:
++    """The running forward's KV pool, under the pool's own names: its layout and
++    per-layer key buffers (a pool offers the ones of its kind)."""
++
++    def __init__(self, pool: Any):
++        self.pool = pool
++
++    @property
++    def uniform_fp8(self) -> bool:
++        return self.pool.uniform_fp8
++
++    @property
++    def request_window(self) -> Any:
++        return self.pool.request_window
++
++    def get_swa_key_buffer_radix(self, layer_id: int) -> torch.Tensor:
++        return self.pool.get_swa_key_buffer_radix(layer_id)
++
++    def get_swa_key_page_size(self) -> int:
++        return self.pool.get_swa_key_page_size()
++
++    def get_swa_key_bytes_per_token(self) -> int:
++        return self.pool.get_swa_key_bytes_per_token()
++
++    def get_extra_key_buffer(self, layer_id: int) -> Optional[torch.Tensor]:
++        return self.pool.get_extra_key_buffer(layer_id)
++
++    def get_extra_key_page_size(self, layer_id: int) -> int:
++        return self.pool.get_extra_key_page_size(layer_id)
++
++    def get_extra_key_bytes_per_token(self, layer_id: int) -> int:
++        return self.pool.get_extra_key_bytes_per_token(layer_id)
++
++    @property
++    def set_swa_key_buffer_radix_fused_norm_rope(self) -> Callable[..., None]:
++        return self.pool.set_swa_key_buffer_radix_fused_norm_rope
++
++    def get_kv_buffer(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor]:
++        """The (key, value) buffers of a full-attention layer, by model layer id (a
++        hybrid pool maps it to its own index), each ``[slots, heads, head_dim]``."""
++        return self.pool.get_kv_buffer(layer_id)
++
++
++class LinearStateView:
++    """The running forward's linear-attention state, read from the linear side of a
++    hybrid attention backend: its per-step metadata and its state pool."""
++
++    def __init__(self, backend: Any):
++        self._backend = backend
++        # mamba_cache_indices: the state slot of each row; padded rows hold -1 when
++        # the batch is padded to a graph's batch size
++        self.metadata = backend.forward_metadata
++        self.pool = backend.req_to_token_pool
++
++    @property
++    def layer_ids(self) -> list[int]:
++        """The model layer ids of the linear-attention layers, ascending."""
++        return sorted(self.pool.mamba_map)
++
++    def layer_cache(self, layer_id: int) -> Any:
++        """One layer's state by model layer id: ``conv`` (a list; ``conv[0]`` is
++        ``[slots, conv_dim, kernel - 1]``) and ``temporal`` (``[slots, HV, V, K]``)."""
++        return self.pool.mamba2_layer_cache(layer_id)
++
++    def track_states(self, forward_batch: Any) -> None:
++        """Copy every linear layer's state of the tracked rows into their track slots,
++        as the standard decode does after its layers; the radix cache reads them.
++        Call once, after the step wrote every layer's state."""
++        indices = self.metadata.mamba_cache_indices
++        for layer_id in self.layer_ids:
++            cache = self.layer_cache(layer_id)
++            # with a layer id the backend fuses every layer's copy at the last one
++            self._backend._track_mamba_state_decode(
++                forward_batch, cache.conv[0], cache.temporal, indices, layer_id
++            )
++
++
++class ForwardView:
++    """The running forward's attention data, read from its attention backend; built
++    at capture for a graph step, so its tensors are the ones the graph replays.
++
++    For a hybrid model, metadata is the full-attention side's and linear is the
++    linear side's state (None for a model without linear attention)."""
++
++    def __init__(self, backend: Any):
++        self._backend = backend
++        full = getattr(backend, "full_attn_backend", backend)
++        self.metadata = getattr(full, "forward_metadata", None)
++        self.kv_pool = KvPoolView(backend.token_to_kv_pool)
++        linear = getattr(backend, "linear_attn_backend", None)
++        self.linear = None if linear is None else LinearStateView(linear)
++
++    @property
++    def req_to_token(self) -> torch.Tensor:
++        """``[req slots, max context]`` int32: the KV slot of each request's tokens,
++        indexed by forward_batch.req_pool_indices."""
++        return self._backend.req_to_token_pool.req_to_token
++
++    @property
++    def trtllm_attn(self) -> bool:
++        return self._backend.trtllm_attn
++
++    @property
++    def attention(self) -> Callable[..., Any]:
++        return self._backend.forward
++
++    @property
++    def store_cache(self) -> Callable[..., None]:
++        return self._backend.store_cache
++
++    @property
++    def swa_out_cache_loc(self) -> Callable[[Any], torch.Tensor]:
++        return self._backend.get_swa_out_cache_loc
++
++    @property
++    def low_ratio_sources(self) -> Callable[..., Any]:
++        return self._backend.forward_low_ratio_sources
++
++    @property
++    def core_compressor(self) -> Callable[..., Any]:
++        return self._backend.forward_core_compressor
++
++
++class MegakernelBinding:
++    """Built at install, before the KV pools exist; read at build or forward. Each
++    source is sealed at the first read that finds it; ``assert_live`` (after the
++    decode graphs are captured) raises once one was reallocated."""
++
++    def __init__(self, *, model: torch.nn.Module):
++        self._model = model
++        self._sealed: dict[str, tuple] = {}
++
++    def forward_view(self) -> ForwardView:
++        """The view of the forward running now (a target step or a draft step)."""
++        from sglang.srt.model_executor.forward_context import get_attn_backend
++
++        view = ForwardView(get_attn_backend())
++        self._seal("kv_pool", view.kv_pool.pool)
++        if view.linear is not None:
++            self._seal("linear_state_pool", view.linear.pool)
++        return view
++
++    def engram_history(self) -> Optional[torch.Tensor]:
++        """The model's Engram hash history ``[slots + 1, width]`` int32, or None."""
++        history = self._history()
++        if history is None or history.shape[1] == 0:
++            return None
++        self._seal("engram_history", history)
++        return history
++
++    def engram_host_table(self, engram: torch.nn.Module) -> Any:
++        """The host table of one of the model's Engram layers, or None."""
++        return engram.embed.host_table
++
++    def assert_live(self) -> None:
++        current = {
++            "kv_pool": self._current_pool,
++            "linear_state_pool": self._current_linear_pool,
++            "engram_history": self._history,
++        }
++        for name, sealed in self._sealed.items():
++            if _identity(current[name]()) != sealed:
++                raise RuntimeError(
++                    f"megakernel binding: {name} was reallocated after its first read"
++                )
++
++    def _seal(self, name: str, value: Any) -> None:
++        self._sealed.setdefault(name, _identity(value))
++
++    def _current_pool(self) -> Any:
++        from sglang.srt.model_executor.forward_context import get_attn_backend
++
++        return get_attn_backend().token_to_kv_pool
++
++    def _current_linear_pool(self) -> Any:
++        from sglang.srt.model_executor.forward_context import get_attn_backend
++
++        linear = getattr(get_attn_backend(), "linear_attn_backend", None)
++        return None if linear is None else linear.req_to_token_pool
++
++    def _history(self) -> Optional[torch.Tensor]:
++        # only models with Engram layers have a hasher
++        hasher = getattr(self._model, "engram_hasher", None)
++        return None if hasher is None else hasher.history
++
++
++def _identity(value: Any) -> tuple:
++    if isinstance(value, torch.Tensor):
++        return (value.data_ptr(), tuple(value.shape), value.dtype)
++    return (id(value),)
+diff --git a/python/sglang/srt/megakernels/guards.py b/python/sglang/srt/megakernels/guards.py
+new file mode 100644
+index 0000000000..8ce75264c1
+--- /dev/null
++++ b/python/sglang/srt/megakernels/guards.py
+@@ -0,0 +1,183 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Startup checks for --enable-nvidia-megakernel on the resolved configuration."""
++
++from __future__ import annotations
++
++import logging
++from typing import Any, Optional
++
++import torch
++
++from sglang.srt.arg_groups.model_override_base import (
++    attention_backends_of,
++    model_config_of,
++    resolving_view,
++)
++from sglang.srt.environ import envs
++from sglang.srt.megakernels.spec import (
++    FLAG,
++    Feature,
++    MegakernelSpec,
++    find_spec,
++    registered_architectures,
++)
++
++logger = logging.getLogger(__name__)
++
++# Leave time for peers to abort before the process watchdog fires.
++MAX_DEADLINE_S, MIN_DEADLINE_S = 60.0, 5.0
++
++
++def device_isa() -> Optional[str]:
++    """This process's GPU as "sm_<major><minor>", or None without a visible GPU."""
++    if not torch.cuda.is_available():
++        return None
++    props = torch.cuda.get_device_properties(torch.cuda.current_device())
++    return f"sm_{props.major}{props.minor}"
++
++
++def deadline_s(watchdog_timeout: Optional[float]) -> float:
++    """The deadline of every cross-GPU wait: half the watchdog, at most MAX_DEADLINE_S."""
++    if not watchdog_timeout or watchdog_timeout <= 0:
++        return MAX_DEADLINE_S
++    return min(MAX_DEADLINE_S, 0.5 * float(watchdog_timeout))
++
++
++def _ragged_verify(cfg: Any) -> bool:
++    mode = envs.SGLANG_RAGGED_VERIFY_MODE.get().lower()
++    return cfg.speculative_algorithm is not None and mode != "static"
++
++
++# One probe a feature, on the resolved settings; a spec accepts features by listing
++# them. PARTITIONED_GPU needs the loaded device, so the runtime checks it.
++FEATURE_PROBES = {
++    Feature.PIPELINE_PARALLEL: lambda c: c.pp_size > 1,
++    Feature.MULTI_NODE_TP: lambda c: c.nnodes > 1,
++    Feature.DP_ATTENTION: lambda c: bool(c.enable_dp_attention),
++    Feature.EXPERT_PARALLEL: lambda c: (c.ep_size or 1) > 1,
++    Feature.EPLB: lambda c: bool(c.enable_eplb),
++    Feature.CONTEXT_PARALLEL: lambda c: (
++        (c.attn_cp_size or 1) > 1 or (c.dcp_size or 1) > 1 or bool(c.enable_prefill_cp)
++    ),
++    Feature.SPECULATIVE_DECODING: lambda c: c.speculative_algorithm is not None,
++    Feature.RAGGED_VERIFY: _ragged_verify,
++    Feature.TWO_BATCH_OVERLAP: lambda c: bool(
++        c.enable_two_batch_overlap or c.enable_single_batch_overlap
++    ),
++    Feature.LORA: lambda c: bool(c.enable_lora or c.lora_paths),
++    Feature.PD_DISAGGREGATION: lambda c: (c.disaggregation_mode or "null") != "null",
++    Feature.RETURN_ROUTED_EXPERTS: lambda c: bool(c.enable_return_routed_experts),
++    Feature.RETURN_INDEXER_TOPK: lambda c: bool(c.enable_return_indexer_topk),
++    Feature.KV_OFFLOAD: lambda c: bool(
++        c.enable_hierarchical_cache
++        or c.disaggregation_decode_enable_offload_kvcache
++        or c.enable_lmcache
++        or c.enable_flexkv
++    ),
++    Feature.HISPARSE: lambda c: bool(c.enable_hisparse),
++    Feature.MEMORY_RELEASE: lambda c: bool(
++        c.enable_memory_saver or c.enable_weights_cpu_backup
++    ),
++    Feature.CPU_OFFLOAD: lambda c: (
++        (c.cpu_offload_gb or 0) > 0 or (c.offload_group_size or 0) > 0
++    ),
++    Feature.TORCH_COMPILE: lambda c: bool(c.enable_torch_compile),
++    Feature.DETERMINISTIC_INFERENCE: lambda c: bool(
++        c.enable_deterministic_inference or c.rl_on_policy_target
++    ),
++    Feature.LINEAR_REPLAYSSM: lambda c: bool(c.enable_linear_replayssm),
++}
++
++
++def features_in_use(cfg: Any) -> set[Feature]:
++    return {feature for feature, probe in FEATURE_PROBES.items() if probe(cfg)}
++
++
++def megakernel_disable_reasons(
++    *, cfg: Any, hf_config: Any, isa: Optional[str]
++) -> tuple[Optional[MegakernelSpec], list[str]]:
++    """The spec for this model and every reason it cannot serve this configuration."""
++    if isa is None:
++        return None, ["no GPU is visible"]
++    spec, why = find_spec(architectures=hf_config.architectures, isa=isa)
++    if spec is None and not registered_architectures():
++        # the plugin loader logs and skips a plugin that fails, so nothing registered
++        why = (
++            "no sglang.srt.plugins plugin registered a megakernel spec; install the "
++            "plugin that provides one (and list it in SGLANG_PLUGINS if that is set), "
++            "or see 'Failed to load plugin' or 'Failed to execute general plugin' above"
++        )
++    if spec is None:
++        return None, [why]
++    req = spec.requires
++    reasons = [
++        f"{f.value} is in use and {spec.name} does not accept it"
++        for f in sorted(features_in_use(cfg) - spec.features, key=lambda f: f.name)
++    ]
++    _, decode_attention = attention_backends_of(cfg)
++    one_of = [
++        ("tp_size", cfg.tp_size, req.tp_sizes),
++        (
++            "decode CUDA graphs",
++            cfg.cuda_graph_config.decode.backend,
++            req.decode_graph_backends,
++        ),
++        # the served steps run on the decode-phase backend
++        ("decode attention backend", decode_attention, req.attention_backends),
++    ] + [(arg, getattr(cfg, arg), ok) for arg, ok in req.server_args.items()]
++    exactly = [
++        # another model's config may not have the field at all
++        (f"config.{key}", getattr(hf_config, key, None), want)
++        for key, want in req.hf_config.items()
++    ] + [(name, getattr(envs, name).get(), want) for name, want in req.env.items()]
++    reasons += [
++        f"{what} {value!r} is not one of {sorted(map(str, allowed))}"
++        for what, value, allowed in one_of
++        if allowed and value not in allowed
++    ]
++    reasons += [
++        f"{what} {value!r} is not {want!r}"
++        for what, value, want in exactly
++        if value != want
++    ]
++    watchdog = cfg.watchdog_timeout
++    if watchdog and deadline_s(watchdog) < MIN_DEADLINE_S:
++        reasons.append(
++            f"--watchdog-timeout {watchdog:g} s leaves the waits a deadline under "
++            f"{MIN_DEADLINE_S:g} s"
++        )
++    if spec.config_disable_reasons is not None:
++        reasons += spec.config_disable_reasons(cfg, hf_config)
++    return spec, reasons
++
++
++def _dtype_reasons(spec: Optional[MegakernelSpec], model_config: Any) -> list[str]:
++    # the resolved dtype, which the HF config alone does not give
++    dtype = str(model_config.dtype).replace("torch.", "")
++    if spec is None or not spec.requires.dtypes or dtype in spec.requires.dtypes:
++        return []
++    return [f"dtype {dtype!r} is not one of {sorted(spec.requires.dtypes)}"]
++
++
++def handle_nvidia_megakernel(server_args: Any) -> None:
++    """Resolution step: fail before the weights load when the flag cannot be served,
++    listing every reason."""
++    cfg = resolving_view(server_args)
++    if not cfg.enable_nvidia_megakernel:
++        return
++    # the specs are registered by plugins; launchers that call http_server.launch_server
++    # directly (not the CLI, not Engine) reach this resolution before any loads them
++    from sglang.srt.plugins import load_plugins
++
++    load_plugins()
++    model_config = model_config_of(server_args)
++    spec, reasons = megakernel_disable_reasons(
++        cfg=cfg, hf_config=model_config.hf_config, isa=device_isa()
++    )
++    reasons += _dtype_reasons(spec, model_config)
++    if reasons:
++        raise ValueError(
++            f"{FLAG} cannot run this setup:\n  - " + "\n  - ".join(reasons)
++        )
++    logger.warning("%s is experimental. Its kernels and coverage may change.", FLAG)
++    logger.info("%s: %s on %s", FLAG, spec.name, device_isa())
+diff --git a/python/sglang/srt/megakernels/runtime.py b/python/sglang/srt/megakernels/runtime.py
+new file mode 100644
+index 0000000000..2a122da910
+--- /dev/null
++++ b/python/sglang/srt/megakernels/runtime.py
+@@ -0,0 +1,376 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Build and whole-step dispatch for --enable-nvidia-megakernel."""
++
++from __future__ import annotations
++
++import functools
++import logging
++import time
++from typing import TYPE_CHECKING, Any, Callable, Optional
++
++import msgspec
++import torch
++import torch.distributed as dist
++
++from sglang.srt.environ import envs
++from sglang.srt.megakernels.binding import MegakernelBinding
++from sglang.srt.megakernels.guards import deadline_s, device_isa
++from sglang.srt.megakernels.spec import (
++    FLAG,
++    BuildContext,
++    BuiltMegakernel,
++    Feature,
++    MegakernelSpec,
++    Step,
++    find_spec,
++    spec_registered,
++)
++from sglang.srt.model_executor.cuda_graph_config import Backend
++from sglang.srt.runtime_context import (
++    get_context,
++    get_device,
++    get_exec,
++    get_parallel,
++    get_spec,
++)
++
++if TYPE_CHECKING:
++    from transformers import PretrainedConfig
++
++    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
++    from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
++        DecodeCudaGraphRunner,
++    )
++
++logger = logging.getLogger(__name__)
++
++
++def megakernel_enabled() -> bool:
++    """Whether this server runs with --enable-nvidia-megakernel."""
++    # the model loader also runs without a server's config (tools, unit tests)
++    if not get_context().is_config_namespace_published("exec"):
++        return False
++    return get_exec().kernel.enable_nvidia_megakernel
++
++
++def install_megakernel(
++    *,
++    model: torch.nn.Module,
++    hf_config: PretrainedConfig,
++    capture_tail_hooks: list[Callable[..., None]],
++    is_draft: bool,
++) -> None:
++    """Build the model's spec and install its forward; runs before KV cache sizing."""
++    if not megakernel_enabled():
++        return
++    spec = _find_spec_on_every_rank(hf_config=hf_config, is_draft=is_draft)
++    if spec is None:
++        return
++    # Resolution checked the target's spec on the server arguments; a draft's spec
++    # is checked only here, on what the runner reads (no server-argument checks).
++    reasons = _requirement_reasons(spec=spec, hf_config=hf_config)
++    reasons += _model_disable_reasons(spec=spec, model=model, hf_config=hf_config)
++    _refuse(_gather_reasons(reasons))
++
++    tokens = _tokens_per_request()
++    binding = MegakernelBinding(model=model)
++    context = BuildContext(
++        widths=tuple(range(tokens, spec.max_rows + 1, tokens)),
++        tokens_per_request=tokens,
++        deadline_s=deadline_s(get_device().watchdog_timeout),
++        binding=binding,
++    )
++    start, free_before = time.perf_counter(), torch.cuda.mem_get_info()[0]
++    built = spec.build(model, hf_config, context)
++    # not setattr: a built object that is an nn.Module must not join the state dict
++    model.__dict__["_megakernel"] = built
++    # Different widths would leave ranks waiting in different collectives.
++    megakernel_agree(tuple(built.widths), what=f"widths {spec.name} built")
++    if spec.max_rows > 0 and not built.widths:
++        _refuse([f"{spec.name} built no width of {list(context.widths)}"])
++    refresh = getattr(built, "refresh_weights", None)
++    # A rank that refuses an update while another applies it would serve mixed weights.
++    megakernel_agree(refresh is not None, what=f"{spec.name} refresh_weights support")
++    if refresh is None:
++        # Captured kernels keep state derived from the weights that updates cannot
++        # refresh.
++        model._derived_weight_cache_error = (
++            f"Online weight updates are not supported with {FLAG} ({spec.name})"
++        )
++    else:
++        _refresh_after_load_weights(model=model, refresh=refresh)
++    built_s = time.perf_counter() - start
++    used_mib = (free_before - torch.cuda.mem_get_info()[0]) / 2**20
++    if not built.widths:
++        # a spec that covers no step, e.g. a draft spec offering draft_sampler only
++        logger.info(
++            "NVIDIA megakernel: %s: %s",
++            spec.name,
++            "draft sampler"
++            if built.draft_sampler is not None
++            else "no step and no draft sampler",
++        )
++        return
++    logger.info(
++        "NVIDIA megakernel: active (%s: %s; widths %s; %s numerics; built in %.1f s, "
++        "%.1f MiB; wait deadline %.0f s)",
++        spec.name,
++        built.summary(),
++        list(built.widths),
++        spec.numerics.kind.value,
++        built_s,
++        used_mib,
++        context.deadline_s,
++    )
++    dispatch = _Dispatch(built=built, original=model.forward, binding=binding)
++    model.forward = dispatch.wrapped()
++    if _decode_graphs_enabled():
++        capture_tail_hooks.append(_CaptureCheck(spec=spec, dispatch=dispatch))
++
++
++def built_megakernel(model: torch.nn.Module) -> Optional[BuiltMegakernel]:
++    """The object the spec built for this model, or None."""
++    return model.__dict__.get("_megakernel")
++
++
++def _refresh_after_load_weights(
++    *, model: torch.nn.Module, refresh: Callable[[list[str]], None]
++) -> None:
++    """Call refresh with the loaded names after each later model.load_weights.
++
++    Every online update (disk, tensor, distributed, IPC, channel) writes the weights
++    through model.load_weights, so the built state is refreshed before the next step
++    reads it. The initial load ran before install and is not observed.
++    """
++    original = model.load_weights
++
++    @functools.wraps(original)
++    def load_weights(weights, *args, **kwargs):
++        names: list[str] = []
++
++        def observed():
++            # a streamed update yields each tensor once; record names, keep tensors
++            for name, tensor in weights:
++                names.append(name)
++                yield name, tensor
++
++        result = original(observed(), *args, **kwargs)
++        refresh(names)
++        return result
++
++    model.load_weights = load_weights
++
++
++def megakernel_agree(value: Any, *, what: str, group: Any = None) -> None:
++    """Raise on every rank unless every rank of group (default: the TP group) holds
++    the same value; ranks that differ would wait in different collectives."""
++    values = _gather_tp(value, group=group)
++    if any(v != value for v in values):
++        raise RuntimeError(
++            f"{FLAG}: the ranks' {what} differ: "
++            + "; ".join(f"rank {rank}: {v}" for rank, v in enumerate(values))
++        )
++
++
++def megakernel_draft_sampler(draft_model: torch.nn.Module) -> Optional[Callable]:
++    """The built draft spec's draft_sampler factory, or None for SGLang's proposal."""
++    built = built_megakernel(draft_model)
++    return None if built is None else built.draft_sampler
++
++
++def _find_spec_on_every_rank(
++    *, hf_config: PretrainedConfig, is_draft: bool
++) -> Optional[MegakernelSpec]:
++    """The spec every rank found; for a draft model, None when no rank has one
++    registered; else raise on every rank."""
++    archs = hf_config.architectures
++    spec, why = find_spec(architectures=archs, isa=device_isa())
++    # Ranks branch together; one skipping the collectives below would hang its peers.
++    lookups = _gather_tp(
++        (
++            spec_registered(archs),
++            why,
++            None if spec is None else (spec.name, spec.api_version),
++        )
++    )
++    if not any(is_registered for is_registered, _, _ in lookups):
++        if is_draft:
++            # A draft model may have no registered spec.
++            logger.info("NVIDIA megakernel: %s; %s keeps its own forward", why, archs)
++            return None
++        # resolution found the target's spec, so the plugin failed to load here
++        _refuse(
++            [
++                f"{why} in the model workers, though argument resolution found it; "
++                "see 'Failed to load plugin' or 'Failed to execute general plugin' "
++                "above"
++            ]
++        )
++    _refuse(
++        [
++            f"rank {rank}: {why}"
++            for rank, (_, why, identity) in enumerate(lookups)
++            if identity is None
++        ]
++    )
++    if len({identity for *_, identity in lookups}) > 1:
++        raise ValueError(
++            f"{FLAG}: the ranks load different specs: "
++            + "; ".join(f"rank {r}: {ident}" for r, (*_, ident) in enumerate(lookups))
++        )
++    return spec
++
++
++def _requirement_reasons(
++    *, spec: MegakernelSpec, hf_config: PretrainedConfig
++) -> list[str]:
++    """The spec's requirements this runner can check without the server arguments."""
++    req, tp_size = spec.requires, get_parallel().tp_size
++    reasons = []
++    # an empty set accepts any TP size, as at argument resolution
++    if req.tp_sizes and tp_size not in req.tp_sizes:
++        reasons.append(f"tp_size {tp_size} is not one of {sorted(req.tp_sizes)}")
++    graph = get_exec().graph.cuda_graph_config
++    backend = Backend.DISABLED if graph is None else graph.decode.backend
++    if req.decode_graph_backends and backend not in req.decode_graph_backends:
++        reasons.append(
++            f"decode CUDA graphs {backend!r} are not one of "
++            f"{sorted(req.decode_graph_backends)}"
++        )
++    exactly = [
++        (f"config.{key}", getattr(hf_config, key, None), want)
++        for key, want in req.hf_config.items()
++    ] + [(name, getattr(envs, name).get(), want) for name, want in req.env.items()]
++    reasons += [
++        f"{what} {v!r} is not {want!r}" for what, v, want in exactly if v != want
++    ]
++    return reasons
++
++
++def _model_disable_reasons(
++    *, spec: MegakernelSpec, model: torch.nn.Module, hf_config: PretrainedConfig
++) -> list[str]:
++    """This rank's reasons the loaded model cannot run the spec."""
++    reasons = []
++    if spec.model_disable_reasons is not None:
++        reasons += spec.model_disable_reasons(model, hf_config)
++    if "forward" in model.__dict__:
++        reasons.append("the model's forward is already replaced on this instance")
++    sms = torch.cuda.get_device_properties(
++        torch.cuda.current_device()
++    ).multi_processor_count
++    if sms < spec.requires.resident_blocks:
++        reasons.append(
++            f"{Feature.PARTITIONED_GPU.value}: {sms} SMs, the persistent grids need "
++            f"{spec.requires.resident_blocks}"
++        )
++    return reasons
++
++
++class _Dispatch:
++    """The installed forward: covered steps run the built megakernel."""
++
++    def __init__(
++        self, *, built: BuiltMegakernel, original: Callable, binding: MegakernelBinding
++    ):
++        self.built, self.original, self.binding = built, original, binding
++        # batch size -> the step planned while capturing its decode graphs; plan reads
++        # only the mode and rows, so every graph variant of a batch size plans alike
++        self.captured: dict[int, Optional[Step]] = {}
++
++    def wrapped(self) -> Callable:
++        # Graph runners and supports_pp inspect the original forward's signature.
++        @functools.wraps(self.original)
++        def forward(input_ids, positions, forward_batch, *args, **kwargs):
++            step = self.built.plan(input_ids, forward_batch, *args, **kwargs)
++            if torch.cuda.is_current_stream_capturing():
++                self.captured[int(forward_batch.batch_size)] = step
++            if step is None:
++                return self.original(
++                    input_ids, positions, forward_batch, *args, **kwargs
++                )
++            return self.built.forward(
++                msgspec.structs.replace(step, view=self.binding.forward_view()),
++                self.original,
++                input_ids,
++                positions,
++                forward_batch,
++                *args,
++                **kwargs,
++            )
++
++        return forward
++
++
++class _CaptureCheck:
++    """Once every decode graph is captured, log the ones that run the megakernel and
++    refuse a runner none of whose graphs do."""
++
++    def __init__(self, *, spec: MegakernelSpec, dispatch: _Dispatch):
++        self.spec, self.dispatch = spec, dispatch
++        self.is_done = False
++
++    def __call__(
++        self,
++        runner: DecodeCudaGraphRunner,
++        out: Any,
++        forward_batch: ForwardBatch,
++        num_tokens: int,
++    ) -> None:
++        captured = self.dispatch.captured
++        if self.is_done or not set(runner.capture_bs) <= set(captured):
++            return
++        self.is_done = True
++        self.dispatch.binding.assert_live()
++        routed = sorted(bs for bs, step in captured.items() if step is not None)
++        if not routed:
++            raise ValueError(
++                f"{FLAG}: none of the {len(captured)} captured decode graphs "
++                f"(batch sizes {sorted(captured)}) runs {self.spec.name}"
++            )
++        logger.info(
++            "NVIDIA megakernel: %s runs the decode graphs of batch sizes %s (%d of "
++            "%d); every other step runs the standard forward",
++            self.spec.name,
++            routed,
++            len(routed),
++            len(captured),
++        )
++
++
++def _tokens_per_request() -> int:
++    """Tokens per request of this server's decode-phase steps."""
++    spec_config = get_spec()
++    if spec_config.speculative_algorithm is None:
++        return 1
++    return int(spec_config.speculative_num_draft_tokens or 1)
++
++
++def _decode_graphs_enabled() -> bool:
++    graph = get_exec().graph.cuda_graph_config
++    return graph is not None and graph.decode.backend != Backend.DISABLED
++
++
++def _gather_tp(obj: Any, group: Any = None) -> list[Any]:
++    """Gather a value from every rank of group (default: TP) through its CPU group."""
++    group = get_parallel().tp_group if group is None else group
++    if group.world_size == 1:
++        return [obj]
++    out: list[Any] = [None] * group.world_size
++    dist.all_gather_object(out, obj, group=group.cpu_group)
++    return out
++
++
++def _gather_reasons(reasons: list[str]) -> list[str]:
++    return [
++        f"rank {rank}: {reason}"
++        for rank, rank_reasons in enumerate(_gather_tp(reasons))
++        for reason in rank_reasons
++    ]
++
++
++def _refuse(reasons: list[str]) -> None:
++    if reasons:
++        raise ValueError(
++            f"{FLAG} cannot run this setup:\n  - " + "\n  - ".join(reasons)
++        )
+diff --git a/python/sglang/srt/megakernels/spec.py b/python/sglang/srt/megakernels/spec.py
+new file mode 100644
+index 0000000000..48ace61603
+--- /dev/null
++++ b/python/sglang/srt/megakernels/spec.py
+@@ -0,0 +1,218 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Megakernel spec contract and the lazy per-architecture registry."""
++
++from __future__ import annotations
++
++import enum
++import importlib
++from typing import TYPE_CHECKING, Any, Callable, Mapping, Optional, Protocol, Sequence
++
++import msgspec
++
++if TYPE_CHECKING:
++    import torch
++
++# bumped on any breaking change to the contracts in this module
++MEGAKERNEL_API_VERSION = 1
++
++# Any sglang.srt.plugins entry point may register specs; none is required by name.
++FLAG = "--enable-nvidia-megakernel"
++
++
++class Feature(enum.Enum):
++    """SGLang features refused unless a spec lists them."""
++
++    PIPELINE_PARALLEL = "pipeline parallelism"
++    MULTI_NODE_TP = "multi-node tensor parallelism"
++    DP_ATTENTION = "DP attention"
++    EXPERT_PARALLEL = "expert parallelism"
++    EPLB = "EPLB"
++    CONTEXT_PARALLEL = "context parallelism"
++    SPECULATIVE_DECODING = "speculative decoding"
++    RAGGED_VERIFY = "uneven tokens per request in verify (SGLANG_RAGGED_VERIFY_MODE)"
++    TWO_BATCH_OVERLAP = "two-batch / single-batch overlap"
++    LORA = "LoRA"
++    PD_DISAGGREGATION = "PD disaggregation"
++    RETURN_ROUTED_EXPERTS = "--enable-return-routed-experts"
++    RETURN_INDEXER_TOPK = "--enable-return-indexer-topk"
++    KV_OFFLOAD = "KV offload"
++    HISPARSE = "hierarchical sparse attention"
++    MEMORY_RELEASE = "memory release"
++    CPU_OFFLOAD = "CPU offload"
++    TORCH_COMPILE = "torch-compiled decode"
++    DETERMINISTIC_INFERENCE = "deterministic inference"
++    # the decode state lives in ring buffers, not in the linear-attention state pool
++    LINEAR_REPLAYSSM = "--enable-linear-replayssm"
++    PARTITIONED_GPU = "partitioned GPUs"
++
++
++class Requirements(msgspec.Struct, frozen=True):
++    """Configuration a spec needs, checked on the resolved settings at startup; an
++    empty field accepts any value."""
++
++    isas: frozenset[str]  # e.g. "sm_103"
++    tp_sizes: frozenset[int]
++    resident_blocks: int = 0  # SMs the persistent grids need
++    dtypes: frozenset[str] = frozenset()
++    # the decode CUDA graph backends the served steps run under
++    decode_graph_backends: frozenset[str] = frozenset({"full", "disabled"})
++    # the decode-phase attention backends whose KV layout the kernels read
++    attention_backends: frozenset[str] = frozenset()
++    # a server argument -> its accepted values, as resolved for this server
++    server_args: Mapping[str, frozenset] = {}
++    # an HF config field -> the value the kernels are built for
++    hf_config: Mapping[str, Any] = {}
++    # an SGLang environment variable in envs -> its required value
++    env: Mapping[str, Any] = {}
++
++
++class NumericsKind(enum.Enum):
++    BITWISE = "bitwise"
++    TOLERANCE = "tolerance"
++
++
++class Numerics(msgspec.Struct, frozen=True):
++    """Declared agreement with the standard path on the same GPU, logged at build."""
++
++    kind: NumericsKind
++    tolerances: Mapping[str, float] = {}
++
++    def __post_init__(self):
++        if self.kind is NumericsKind.TOLERANCE and not self.tolerances:
++            raise ValueError("a TOLERANCE spec must state its tolerances")
++
++
++class BuildContext(msgspec.Struct, frozen=True):
++    widths: tuple[int, ...]  # step rows to build, ascending
++    tokens_per_request: int
++    deadline_s: float  # every cross-GPU wait's deadline, below --watchdog-timeout
++    # SGLang's runtime state for this model (megakernels/binding.py)
++    binding: Any = None
++
++
++class Step(msgspec.Struct, frozen=True):
++    """A covered step, decided from host state alike on every rank."""
++
++    mode: str  # "decode" or "target_verify"
++    rows: int
++    # the running forward's ForwardView, set by SGLang before forward runs the step
++    view: Any = None
++
++
++class BuiltMegakernel(Protocol):
++    """The object a spec's build returns.
++
++    draft_sampler is None, or a factory the DSpark draft sampler calls once with
++    (*, gamma, max_bs, greedy_draft, noise, draft_tokens, step_logits,
++    step_temperatures). It returns bs -> None (SGLang's proposal at that batch size)
++    or step(hidden_states, anchor_tokens) -> (tokens, confidence_features), which
++    replaces the base logits and the Markov block. The sizes it serves must agree on
++    every rank (SGLang refuses otherwise), and a step must produce identical tokens
++    on every rank, since it replaces the proposal's rank-0 broadcast; write
++    draft_tokens[: bs * gamma] and the sampled rows' step_logits; and advance
++    noise.offset once per sampled block.
++
++    SGLang's runtime state reaches a build as BuildContext.binding and a covered
++    step as Step.view (megakernels/binding.py, which also lists what else may be
++    called, written or read).
++
++    refresh_weights is None, or called with the names of the checkpoint tensors
++    after every model.load_weights of an online weight update (one call per
++    bucket), on every rank alike; it recomputes the state the build derived from
++    them. With None, SGLang refuses online weight updates.
++    """
++
++    widths: tuple[int, ...]  # the rows it built, possibly fewer than requested
++    draft_sampler: Optional[Callable[..., Callable[[int], Optional[Callable]]]]
++    refresh_weights: Optional[Callable[[list[str]], None]]
++
++    def summary(self) -> str:
++        """What was built, for the startup line."""
++
++    def plan(
++        self, input_ids: Any, forward_batch: Any, *args: Any, **kwargs: Any
++    ) -> Optional[Step]:
++        """The step to run, or None for the model's own forward; host-only, so a
++        captured graph replays the decision made at capture."""
++
++    def forward(self, step: Step, original: Callable, *args: Any, **kwargs: Any) -> Any:
++        """Run step in place of original (the model's bound forward), taking and
++        returning what it does; capturable in a CUDA graph."""
++
++
++class MegakernelSpec(msgspec.Struct, frozen=True):
++    """A model-specific plugin contract; build returns its BuiltMegakernel.
++
++    Argument resolution checks the served model's spec in full. A spec found only
++    at load, e.g. for a draft model, is checked there against its ISA, tp_sizes,
++    decode_graph_backends, hf_config, env and model_disable_reasons.
++    """
++
++    name: str
++    requires: Requirements
++    features: frozenset[Feature]  # the refused-by-default features it accepts
++    numerics: Numerics
++    max_rows: int  # the widest step it covers
++    build: Callable[[torch.nn.Module, Any, BuildContext], BuiltMegakernel]
++    api_version: int  # the MEGAKERNEL_API_VERSION this spec is written against
++    # (model, hf_config), after load: per-rank checks of the loaded model
++    model_disable_reasons: Optional[Callable[[torch.nn.Module, Any], list[str]]] = None
++    # (cfg, hf_config), before load: the checks requires cannot state
++    config_disable_reasons: Optional[Callable[[Any, Any], list[str]]] = None
++
++
++# HF architecture -> the "module:attribute" path of its spec
++_REGISTRY: dict[str, str] = {}
++
++
++def register(*, architecture: str, path: str) -> None:
++    """Register a module:attribute spec path from the plugin entry point."""
++    if _REGISTRY.get(architecture, path) != path:
++        raise ValueError(
++            f"a megakernel spec for {architecture} is already registered: "
++            f"{_REGISTRY[architecture]}"
++        )
++    _REGISTRY[architecture] = path
++
++
++def registered_architectures() -> list[str]:
++    """The architectures with a registered spec; empty when no plugin registered any."""
++    return sorted(_REGISTRY)
++
++
++def spec_registered(architectures: Optional[Sequence[str]]) -> bool:
++    """Whether any of the architectures has a registered spec, usable or not."""
++    return any(arch in _REGISTRY for arch in architectures or ())
++
++
++def find_spec(
++    *, architectures: Optional[Sequence[str]], isa: Optional[str]
++) -> tuple[Optional[MegakernelSpec], str]:
++    """The compatible spec and an empty reason, or None and a rejection reason."""
++    why = []
++    for arch in architectures or ():
++        path = _REGISTRY.get(arch)
++        if path is None:
++            continue
++        module, _, attr = path.partition(":")
++        # a broken plugin is a refusal every rank reports, not a crash on one
++        try:
++            spec = getattr(importlib.import_module(module), attr)
++        except Exception as e:
++            why.append(f"{path} does not import: {type(e).__name__}: {e}")
++            continue
++        if not isinstance(spec, MegakernelSpec):
++            why.append(f"{path} is not a MegakernelSpec")
++        elif spec.api_version != MEGAKERNEL_API_VERSION:
++            why.append(
++                f"{path} uses megakernel API version {spec.api_version}; this "
++                f"SGLang requires version {MEGAKERNEL_API_VERSION}"
++            )
++        elif isa not in spec.requires.isas:
++            why.append(f"{path} supports {sorted(spec.requires.isas)}, not {isa}")
++        else:
++            return spec, ""
++    return None, "; ".join(why) or (
++        f"no megakernel spec is registered for {list(architectures or ())} "
++        f"(registered: {registered_architectures()})"
++    )
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index 604a72f4ed..56899e17c9 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -81,6 +81,7 @@ from sglang.srt.layers.sampler import create_sampler
+ from sglang.srt.lora.lora_manager import LoRAManager, init_lora_cuda_graph_moe_buffers
+ from sglang.srt.lora.lora_registry import LoRARef
+ from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
++from sglang.srt.megakernels.runtime import install_megakernel
+ from sglang.srt.mem_cache import kv_cache_dtype
+ from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+ from sglang.srt.mem_cache.kv_cache_configurator import (
+@@ -672,6 +673,13 @@ class ModelRunner:
+         self.maybe_init_lora_manager()
+         self.maybe_enable_batch_invariant_mode()
+         self.configure_kv_cache_dtype()
++        # after every post-load change to the model, before the KV cache is sized
++        install_megakernel(
++            model=self.model,
++            hf_config=self.model_config.hf_config,
++            capture_tail_hooks=self.capture_tail_hooks,
++            is_draft=self.is_draft_worker,
++        )
+ 
+     def init_memory_saver_adapter(self):
+         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
+diff --git a/test/registered/unit/megakernels/_fakes.py b/test/registered/unit/megakernels/_fakes.py
+new file mode 100644
+index 0000000000..d04ac70842
+--- /dev/null
++++ b/test/registered/unit/megakernels/_fakes.py
+@@ -0,0 +1,118 @@
++"""Shared fakes for the megakernel unit tests: one spec, one model, server arguments."""
++
++from types import SimpleNamespace
++
++import torch
++from msgspec.structs import replace
++
++from sglang.srt.megakernels import spec as registry
++from sglang.srt.megakernels.spec import (
++    Feature,
++    MegakernelSpec,
++    Numerics,
++    NumericsKind,
++    Requirements,
++    Step,
++)
++from sglang.srt.model_executor.cuda_graph_config import default_cuda_graph_config
++from sglang.srt.server_args import ServerArgs
++from sglang.test.ci.ci_register import register_cpu_ci
++
++register_cpu_ci(
++    est_time=0, stage="base-a", runner_config="cpu", disabled="megakernel test fakes"
++)
++
++ARCH, ISA = "FakeMegaForCausalLM", "sm_103"
++
++
++class FakeBuilt:
++    """Covers steps of 1-4 rows and records the steps it ran."""
++
++    draft_sampler = None
++    refresh_weights = None
++
++    def __init__(self, widths):
++        self.widths = tuple(w for w in widths if w <= 4)
++        self.steps, self.views = [], []
++
++    def summary(self):
++        return "fake"
++
++    def plan(self, input_ids, forward_batch, *args, **kwargs):
++        rows = int(input_ids.shape[0])
++        return Step(mode="decode", rows=rows) if rows in self.widths else None
++
++    def forward(self, step, original, input_ids, positions, forward_batch, **kw):
++        self.steps.append(step.rows)
++        self.views.append(step.view)
++        return "megakernel"
++
++
++def _build(model, hf_config, context):
++    model.context = context
++    return FakeBuilt(context.widths)
++
++
++class RefreshingBuilt(FakeBuilt):
++    """Records the names each refresh_weights call got."""
++
++    def __init__(self, widths):
++        super().__init__(widths)
++        self.refreshed = []
++        self.refresh_weights = self.refreshed.append
++
++
++SPEC = MegakernelSpec(
++    name="fake",
++    requires=Requirements(isas=frozenset({ISA}), tp_sizes=frozenset({4})),
++    features=frozenset({Feature.SPECULATIVE_DECODING}),
++    numerics=Numerics(kind=NumericsKind.BITWISE),
++    max_rows=8,
++    build=_build,
++    api_version=registry.MEGAKERNEL_API_VERSION,
++)
++# an empty field accepts any value
++ANY_TP = replace(SPEC, requires=replace(SPEC.requires, tp_sizes=frozenset()))
++# a spec whose built state follows online weight updates
++REFRESHING = replace(SPEC, build=lambda model, hf, ctx: RefreshingBuilt(ctx.widths))
++# a spec that reads one decode attention backend's KV layout
++FA3_ONLY = replace(
++    SPEC, requires=replace(SPEC.requires, attention_backends=frozenset({"fa3"}))
++)
++# a draft spec: builds no width, offers only the draft sampler
++DRAFT = replace(
++    SPEC,
++    max_rows=0,
++    build=lambda model, hf, ctx: SimpleNamespace(
++        widths=(),
++        summary=lambda: "draft sampler",
++        draft_sampler=print,
++        refresh_weights=None,
++    ),
++)
++
++
++class Lm(torch.nn.Module):
++    def forward(self, input_ids, positions, forward_batch, input_embeds=None):
++        return "standard"
++
++    def load_weights(self, weights):
++        self.loaded = [name for name, _ in weights]
++        return "loaded"
++
++
++def batch(rows):
++    return SimpleNamespace(batch_size=rows, input_ids=torch.zeros(rows))
++
++
++def server_args(**kw):
++    """Arguments as the resolution step sees them, with the graph config resolved."""
++    defaults = {
++        "model_path": "dummy",
++        "tp_size": 4,
++        "kv_cache_dtype": "fp8_e4m3",
++        "speculative_algorithm": "DSPARK",
++        "speculative_num_draft_tokens": 6,
++        "cuda_graph_config": default_cuda_graph_config(),
++    }
++    return ServerArgs(**{**defaults, **kw})
+diff --git a/test/registered/unit/megakernels/test_megakernel_binding.py b/test/registered/unit/megakernels/test_megakernel_binding.py
+new file mode 100644
+index 0000000000..242b0f34e6
+--- /dev/null
++++ b/test/registered/unit/megakernels/test_megakernel_binding.py
+@@ -0,0 +1,139 @@
++"""CPU checks of the megakernel binding: the view is the running forward's attention
++backend and KV pool, and a source replaced after capture is caught."""
++
++import unittest
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import torch
++
++from sglang.srt.megakernels import binding as mb
++from sglang.test.ci.ci_register import register_cpu_ci
++from sglang.test.test_utils import CustomTestCase
++
++register_cpu_ci(est_time=5, stage="base-a", runner_config="cpu")
++
++BACKEND = "sglang.srt.model_executor.forward_context.get_attn_backend"
++
++
++class Pool:
++    uniform_fp8 = False
++    request_window = None
++
++    def __init__(self):
++        self.keys = [torch.zeros(4, 8) for _ in range(2)]
++
++    def get_swa_key_buffer_radix(self, layer_id):
++        return self.keys[layer_id]
++
++    def get_extra_key_page_size(self, layer_id):
++        return 64 + layer_id
++
++    def set_swa_key_buffer_radix_fused_norm_rope(self, **kw):
++        return kw
++
++
++def backend(pool):
++    return SimpleNamespace(
++        token_to_kv_pool=pool,
++        forward_metadata=SimpleNamespace(core_attn_metadata="core"),
++        trtllm_attn=False,
++        forward=lambda *a, **k: "attention",
++        store_cache=lambda **k: None,
++        get_swa_out_cache_loc=lambda fb: "swa_loc",
++        forward_low_ratio_sources=lambda **k: "sources",
++        forward_core_compressor=lambda **k: "compressed",
++    )
++
++
++class TestMegakernelBinding(CustomTestCase):
++    def test_the_view_is_the_running_forwards_backend_and_pool(self):
++        pool = Pool()
++        with patch(BACKEND, return_value=backend(pool)):
++            view = mb.MegakernelBinding(model=torch.nn.Module()).forward_view()
++        self.assertEqual(view.metadata.core_attn_metadata, "core")
++        self.assertIs(view.kv_pool.pool, pool)
++        self.assertIs(view.kv_pool.get_swa_key_buffer_radix(1), pool.keys[1])
++
++    def test_a_replaced_source_fails_assert_live_by_name(self):
++        model = torch.nn.Module()
++        model.engram_hasher = SimpleNamespace(history=torch.zeros(5, 3))
++        binding = mb.MegakernelBinding(model=model)
++        attn_backend = backend(Pool())
++        with patch(BACKEND, return_value=attn_backend):
++            binding.forward_view()
++            self.assertIs(binding.engram_history(), model.engram_hasher.history)
++            binding.assert_live()
++            model.engram_hasher.history = torch.zeros(9, 3)
++            with self.assertRaisesRegex(RuntimeError, "engram_history"):
++                binding.assert_live()
++        binding = mb.MegakernelBinding(model=torch.nn.Module())
++        with patch(BACKEND, return_value=backend(Pool())):
++            binding.forward_view()
++        with patch(BACKEND, return_value=backend(Pool())):
++            with self.assertRaisesRegex(RuntimeError, "kv_pool"):
++                binding.assert_live()
++
++    def test_a_hybrid_view_reads_both_sides_and_tracks_every_linear_layer(self):
++        kv_pool, state_pool = Pool(), StatePool(layer_ids=(0, 1, 2, 4, 5, 6))
++        hybrid = hybrid_backend(kv_pool, state_pool)
++        with patch(BACKEND, return_value=hybrid):
++            binding = mb.MegakernelBinding(model=torch.nn.Module())
++            view = binding.forward_view()
++        # the full-attention side's metadata and KV pool, the linear side's state
++        self.assertEqual(view.metadata.core_attn_metadata, "core")
++        self.assertIs(view.kv_pool.pool, kv_pool)
++        self.assertIs(view.req_to_token, hybrid.req_to_token_pool.req_to_token)
++        self.assertEqual(view.linear.layer_ids, [0, 1, 2, 4, 5, 6])
++        self.assertIs(view.linear.layer_cache(4).temporal, state_pool.caches[4].temporal)
++        view.linear.track_states("batch")
++        tracked = hybrid.linear_attn_backend.tracked
++        self.assertEqual([layer for *_, layer in tracked], [0, 1, 2, 4, 5, 6])
++        self.assertTrue(all(fb == "batch" for fb, *_ in tracked))
++        # a reallocated state pool is caught like a reallocated KV pool
++        with patch(BACKEND, return_value=hybrid):
++            binding.assert_live()
++        hybrid.linear_attn_backend.req_to_token_pool = StatePool(layer_ids=(0,))
++        with patch(BACKEND, return_value=hybrid):
++            with self.assertRaisesRegex(RuntimeError, "linear_state_pool"):
++                binding.assert_live()
++
++    def test_a_model_without_linear_attention_has_no_linear_view(self):
++        with patch(BACKEND, return_value=backend(Pool())):
++            view = mb.MegakernelBinding(model=torch.nn.Module()).forward_view()
++        self.assertIsNone(view.linear)
++
++
++class StatePool:
++    def __init__(self, layer_ids):
++        self.mamba_map = {layer: i for i, layer in enumerate(layer_ids)}
++        self.caches = {
++            layer: SimpleNamespace(conv=[torch.zeros(3, 2)], temporal=torch.zeros(3, 4))
++            for layer in layer_ids
++        }
++
++    def mamba2_layer_cache(self, layer_id):
++        return self.caches[layer_id]
++
++
++class LinearBackend:
++    def __init__(self, state_pool):
++        self.req_to_token_pool = state_pool
++        self.forward_metadata = SimpleNamespace(mamba_cache_indices=torch.arange(3))
++        self.tracked = []
++
++    def _track_mamba_state_decode(self, forward_batch, conv, ssm, indices, layer_id):
++        self.tracked.append((forward_batch, conv, ssm, indices, layer_id))
++
++
++def hybrid_backend(kv_pool, state_pool):
++    return SimpleNamespace(
++        token_to_kv_pool=kv_pool,
++        req_to_token_pool=SimpleNamespace(req_to_token=torch.zeros(2, 8)),
++        full_attn_backend=backend(kv_pool),
++        linear_attn_backend=LinearBackend(state_pool),
++    )
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/test/registered/unit/megakernels/test_megakernel_guards.py b/test/registered/unit/megakernels/test_megakernel_guards.py
+new file mode 100644
+index 0000000000..7920f7cc22
+--- /dev/null
++++ b/test/registered/unit/megakernels/test_megakernel_guards.py
+@@ -0,0 +1,90 @@
++"""CPU checks of --enable-nvidia-megakernel's startup resolution."""
++
++import sys
++import unittest
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import patch
++
++from sglang.srt.megakernels import guards, runtime
++from sglang.srt.megakernels import spec as registry
++from sglang.srt.megakernels.guards import megakernel_disable_reasons
++from sglang.test.ci.ci_register import register_cpu_ci
++from sglang.test.test_utils import CustomTestCase
++
++sys.path.insert(0, str(Path(__file__).resolve().parent))
++from _fakes import ARCH, ISA, server_args  # noqa: E402
++
++register_cpu_ci(est_time=5, stage="base-a", runner_config="cpu")
++
++
++class TestMegakernelGuards(CustomTestCase):
++    def setUp(self):
++        registry_patch = patch.dict(registry._REGISTRY, clear=True)
++        registry_patch.start()
++        self.addCleanup(registry_patch.stop)
++
++    def test_a_disabled_flag_looks_nothing_up_and_keeps_the_forward(self):
++        with patch.object(guards, "megakernel_disable_reasons") as lookup:
++            guards.handle_nvidia_megakernel(server_args())
++        lookup.assert_not_called()
++        model = SimpleNamespace()  # any attribute read would raise
++        with patch.object(runtime, "megakernel_enabled", return_value=False):
++            runtime.install_megakernel(
++                model=model, hf_config=None, capture_tail_hooks=[], is_draft=False
++            )
++        self.assertEqual(vars(model), {})
++
++    def test_an_enabled_flag_loads_the_plugins_before_the_lookup(self):
++        """http_server.launch_server resolves the arguments before it loads plugins."""
++        calls = []
++        with patch("sglang.srt.plugins.load_plugins", lambda: calls.append("load")), \
++                patch.object(guards, "model_config_of"), \
++                patch.object(guards, "megakernel_disable_reasons",
++                             side_effect=lambda **kw: calls.append("lookup") or (None, ["x"])), \
++                self.assertRaises(ValueError):
++            guards.handle_nvidia_megakernel(server_args(enable_nvidia_megakernel=True))
++        self.assertEqual(calls, ["load", "lookup"])
++
++    def _reasons(self, path, **kw):
++        registry._REGISTRY.clear()
++        if path is not None:
++            registry.register(architecture=ARCH, path=path)
++        hf_config = SimpleNamespace(architectures=[ARCH], model_type="fake")
++        _, reasons = megakernel_disable_reasons(
++            cfg=server_args(**kw), hf_config=hf_config, isa=ISA
++        )
++        return reasons
++
++    def test_an_unmet_tp_size_is_refused_and_an_empty_field_accepts_any(self):
++        def tp_reasons(path):
++            return [r for r in self._reasons(path, tp_size=8) if "tp_size" in r]
++
++        self.assertTrue(tp_reasons("_fakes:SPEC"))
++        self.assertEqual(tp_reasons("_fakes:ANY_TP"), [])
++
++    def test_any_plugin_may_register_and_none_registered_is_named(self):
++        """No entry point name is required: a spec from any plugin is used."""
++        self.assertEqual(self._reasons("_fakes:SPEC"), [])
++        (reason,) = self._reasons(None)
++        self.assertIn("no sglang.srt.plugins plugin registered", reason)
++
++    def test_the_decode_attention_backend_must_be_one_the_spec_reads(self):
++        def backend_reasons(**kw):
++            return [r for r in self._reasons("_fakes:FA3_ONLY", **kw) if "attention" in r]
++
++        self.assertEqual(backend_reasons(attention_backend="fa3"), [])
++        # the decode-phase backend is the one checked
++        self.assertEqual(
++            backend_reasons(attention_backend="triton", decode_attention_backend="fa3"),
++            [],
++        )
++        self.assertTrue(backend_reasons(attention_backend="triton"))
++
++    def test_linear_replayssm_is_refused_unless_accepted(self):
++        reasons = self._reasons("_fakes:SPEC", enable_linear_replayssm=True)
++        self.assertTrue(any("--enable-linear-replayssm" in r for r in reasons))
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/test/registered/unit/megakernels/test_megakernel_runtime.py b/test/registered/unit/megakernels/test_megakernel_runtime.py
+new file mode 100644
+index 0000000000..b8d0819e80
+--- /dev/null
++++ b/test/registered/unit/megakernels/test_megakernel_runtime.py
+@@ -0,0 +1,170 @@
++"""CPU checks of the megakernel install, dispatch and capture check."""
++
++import sys
++import unittest
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import torch
++from msgspec.structs import replace
++
++from sglang.srt.megakernels import runtime
++from sglang.srt.megakernels import spec as registry
++from sglang.srt.megakernels.binding import MegakernelBinding
++from sglang.srt.runtime_context import publish, reset_context
++from sglang.test.ci.ci_register import register_cpu_ci
++from sglang.test.test_utils import CustomTestCase
++
++sys.path.insert(0, str(Path(__file__).resolve().parent))
++from _fakes import ANY_TP, ARCH, ISA, SPEC, Lm, batch, server_args  # noqa: E402
++
++register_cpu_ci(est_time=5, stage="base-a", runner_config="cpu")
++
++
++def install(
++    *,
++    archs=(ARCH,),
++    gathered=None,
++    tokens=2,
++    hooks=None,
++    is_draft=False,
++):
++    """install_megakernel on an Lm as rank 0 of the published server; gathered maps
++    a gathered value to what the other ranks report, default the same as this rank."""
++    lm, hooks = Lm(), [] if hooks is None else hooks
++    gpu = SimpleNamespace(multi_processor_count=160)
++    with (
++        patch.object(runtime, "device_isa", return_value=ISA),
++        patch.object(runtime, "deadline_s", return_value=30.0),
++        patch.object(
++            runtime, "_gather_tp", side_effect=gathered or (lambda x, group=None: [x])
++        ),
++        patch.object(runtime, "_tokens_per_request", return_value=tokens),
++        patch.object(runtime, "_decode_graphs_enabled", return_value=True),
++        patch.object(torch.cuda, "current_device", return_value=0),
++        patch.object(torch.cuda, "get_device_properties", return_value=gpu),
++        patch.object(torch.cuda, "mem_get_info", return_value=(0, 0)),
++    ):
++        runtime.install_megakernel(
++            model=lm,
++            hf_config=SimpleNamespace(architectures=list(archs)),
++            capture_tail_hooks=hooks,
++            is_draft=is_draft,
++        )
++    return lm
++
++
++class TestMegakernelRuntime(CustomTestCase):
++    def setUp(self):
++        registry_patch = patch.dict(registry._REGISTRY, clear=True)
++        registry_patch.start()
++        self.addCleanup(registry_patch.stop)
++        registry.register(architecture=ARCH, path="_fakes:SPEC")
++        publish(server_args(enable_nvidia_megakernel=True), role="test")
++        self.addCleanup(reset_context)
++        # the running forward's view reads its attention backend, which tests lack
++        view_patch = patch.object(
++            MegakernelBinding, "forward_view", return_value="view"
++        )
++        view_patch.start()
++        self.addCleanup(view_patch.stop)
++
++    def _install_spec(self, spec, **kw):
++        with patch.object(runtime, "find_spec", return_value=(spec, "")):
++            return install(**kw)
++
++    def test_covered_steps_run_the_megakernel_and_others_the_forward(self):
++        lm = install(tokens=1)
++        built = runtime.built_megakernel(lm)
++        with patch.object(
++            torch.cuda, "is_current_stream_capturing", return_value=False
++        ):
++            self.assertEqual(lm(batch(4).input_ids, None, batch(4)), "megakernel")
++            self.assertEqual(lm(batch(6).input_ids, None, batch(6)), "standard")
++        # only a covered step runs the megakernel, with the running forward's view
++        self.assertEqual((built.steps, built.views), ([4], ["view"]))
++
++    def test_a_target_without_a_usable_spec_is_refused_and_a_draft_keeps_its_forward(
++        self,
++    ):
++        # the flag must not silently run the model's own forward
++        with self.assertRaisesRegex(ValueError, "in the model workers"):
++            install(archs=["TargetWithoutSpec"])
++        tp8 = replace(SPEC, requires=replace(SPEC.requires, tp_sizes=frozenset({8})))
++        with self.assertRaisesRegex(ValueError, "tp_size 4"):
++            self._install_spec(tp8)
++        # an empty field accepts any value
++        self.assertIsNotNone(runtime.built_megakernel(self._install_spec(ANY_TP)))
++        with self.assertLogs(runtime.logger, "INFO") as logs:
++            lm = install(archs=["DraftWithoutSpec"], is_draft=True)
++        self.assertNotIn("forward", lm.__dict__)
++        self.assertIn("keeps its own forward", "".join(logs.output))
++        registry.register(architecture="Draft", path="_fakes:DRAFT")
++        # a draft spec offers only its draft sampler
++        lm = install(archs=["Draft"], is_draft=True)
++        self.assertNotIn("forward", lm.__dict__)
++        self.assertIs(runtime.megakernel_draft_sampler(lm), print)
++
++    def test_ranks_that_disagree_are_refused_on_every_rank(self):
++        """A rank that differs would wait in a different collective."""
++
++        def no_spec_on_rank_1(value, group=None):
++            return [value, (value[0], "rank-1 reason", None)]
++
++        def fewer_widths_on_rank_1(value, group=None):
++            widths = isinstance(value, tuple) and all(isinstance(w, int) for w in value)
++            return [value, value[:1]] if widths else [value]
++
++        with self.assertRaisesRegex(ValueError, "rank 1: rank-1 reason"):
++            install(gathered=no_spec_on_rank_1)
++        with self.assertRaisesRegex(RuntimeError, "widths fake built differ"):
++            install(gathered=fewer_widths_on_rank_1)
++
++    def test_capture_check_refuses_when_no_graph_runs_the_megakernel(self):
++        def capture(sizes, capture_bs):
++            hooks = []
++            lm = install(tokens=1, hooks=hooks)
++            runner = SimpleNamespace(capture_bs=capture_bs)
++            with patch.object(
++                torch.cuda, "is_current_stream_capturing", return_value=True
++            ):
++                for bs in sizes:
++                    lm(batch(bs).input_ids, None, batch(bs))
++                    hooks[0](runner, None, batch(bs), bs)
++
++        capture([2, 8], capture_bs=[2, 8, 16])  # not all captured yet: no verdict
++        capture([2, 8], capture_bs=[2, 8])
++        with self.assertRaisesRegex(ValueError, "none of the 2 captured decode graphs"):
++            capture([8, 16], capture_bs=[8, 16])
++
++    def test_weight_updates_are_refused_without_refresh_weights(self):
++        lm = install(tokens=1)
++        self.assertIn("not supported", lm._derived_weight_cache_error)
++        self.assertNotIn("load_weights", lm.__dict__)
++
++    def test_refresh_weights_follows_every_later_load_weights(self):
++        from _fakes import REFRESHING
++
++        lm = self._install_spec(REFRESHING, tokens=1)
++        built = runtime.built_megakernel(lm)
++        self.assertIsNone(getattr(lm, "_derived_weight_cache_error", None))
++        # a streamed update: the names reach the model's loader and then refresh
++        stream = iter([("a.weight", torch.zeros(1)), ("b.weight", torch.zeros(1))])
++        self.assertEqual(lm.load_weights(stream), "loaded")
++        self.assertEqual(lm.loaded, ["a.weight", "b.weight"])
++        lm.load_weights([("c.weight", torch.zeros(1))])
++        self.assertEqual(built.refreshed, [["a.weight", "b.weight"], ["c.weight"]])
++
++    def test_ranks_that_disagree_on_refresh_support_are_refused(self):
++        from _fakes import REFRESHING
++
++        def no_refresh_on_rank_1(value, group=None):
++            return [value, False] if value is True else [value]
++
++        with self.assertRaisesRegex(RuntimeError, "refresh_weights support differ"):
++            self._install_spec(REFRESHING, gathered=no_refresh_on_rank_1)
++
++
++if __name__ == "__main__":
++    unittest.main()
