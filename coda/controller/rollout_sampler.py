@@ -33,6 +33,7 @@ def _ds_bucket() -> dict:
         "rewards": [],
         "prompt_length": [],
         "response_len": [],
+        "llm_response_len": [],
         "num_turns": [],
         "compactions_per_trajectory": [],
         "response_clipped": 0,
@@ -62,10 +63,17 @@ def _accumulate_ds_metrics(bucket: dict, traj_group: TrajectoryGroup, data_sourc
         ds_cfg = data_sources[t.ds_index]
         response_len = len(t.rollout_log_probs)
         prompt_len = len(t.tokens) - response_len
+        # response_len counts the whole response space (LLM output + tool outputs +
+        # re-appearing context). llm_response_len counts only tokens the LLM actually
+        # generated: non-LLM positions carry rollout_weight_version == -1 (and this marker
+        # is independent of loss-mask off-policy filtering, so it is a faithful "pure model
+        # output" length).
+        llm_response_len = sum(1 for v in t.rollout_weight_versions if v >= 0)
 
         bucket["rewards"].append(t.reward)
         bucket["prompt_length"].append(prompt_len)
         bucket["response_len"].append(response_len)
+        bucket["llm_response_len"].append(llm_response_len)
         bucket["num_turns"].append(t.num_turns)
         max_response = ds_cfg.max_response_len_per_trajectory
         if max_response > 0 and response_len >= max_response:
@@ -98,6 +106,7 @@ def _summary_metrics(bucket: dict, key_prefix: str) -> dict[str, float]:
     if n > 0:
         for name, field in (("reward", "rewards"),
                             ("response_length", "response_len"),
+                            ("llm_response_length", "llm_response_len"),
                             ("num_turns", "num_turns"),
                             ("compactions", "compactions_per_trajectory")):
             values = bucket[field]
