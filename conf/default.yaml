@@ -149,16 +149,10 @@ agentflow:
 # Only read when run_mode=sft. Each dataset row's input_key holds the full conversation
 # (OpenAI-style message list); assistant turns are trained, everything else is context.
 # An assistant message with "step_loss_mask": 0 stays in context but is not trained on.
+# Assistant turns are located by markers probed from the active chat template at startup
+# (logged as "[sft] loss mask probed from chat template"); there is nothing to configure.
 sft:
   max_seq_len: null       # truncate rendered conversations to this many tokens; null = no limit
-  loss_mask:
-    # Built-in preset for locating assistant turns in the rendered chat template.
-    # Must be set explicitly per model; there is no auto-detection:
-    #   qwen         ChatML Qwen2.5/3/3.5 checkpoints. The thinking prefix is probed
-    #                from the active template, so one preset covers both thinking modes.
-    #   deepseek_v4  DeepSeek-V4/V4.1 checkpoints rendered by the official encoder.
-    # Other chat templates are not supported by run_mode=sft.
-    preset: null          # qwen|deepseek_v4
 
 tracking:
   project_name: "default"

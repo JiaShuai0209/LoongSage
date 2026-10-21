@@ -5,97 +5,96 @@ re-tokenized with ``return_offsets_mapping``.  Each assistant turn is located in
 the rendered text by its ``assistant_header`` and closed by its ``end_marker``;
 the characters in between (minus a leading generation-prompt prefix such as
 ``<think>\\n``) are marked trainable and projected onto tokens via the offset
-mapping.  This mirrors slime's ``gen_multi_turn_loss_mask_qwen3_5`` with built-in
-template presets for Qwen and DeepSeek-V4/V4.1.
+mapping.  This mirrors slime's ``gen_multi_turn_loss_mask_qwen3_5``.
+
+The three markers are not configured per model: at construction a sentinel
+conversation is rendered with the active chat template and the text the template
+wraps around the sentinels is read back as ``assistant_header`` /
+``skip_prefixes`` / ``end_marker``, then verified by masking that same
+conversation.
 """
 
 from __future__ import annotations
 
+import os
 from collections.abc import Mapping
 from typing import Any
 
 from coda.agentflow.tokenizer_manager import _ensure_token_list
 
-# ``skip_prefixes: None`` means "derive from the generation prompt" (see
-# ``LossMaskGenerator._probe_generation_prefix``).
-LOSS_MASK_PRESETS: dict[str, dict[str, Any]] = {
-    # Qwen2.5/3/3.5 chat models that use the ChatML markers below.  The
-    # generation-time thinking prefix is probed from the active chat template,
-    # because it differs between model versions and thinking configurations.
-    "qwen": {
-        "assistant_header": "<|im_start|>assistant\n",
-        "end_marker": "<|im_end|>",
-        "skip_prefixes": None,
-    },
-    # DeepSeek-V4 and V4.1 use the same official assistant/eos markers.  The
-    # official encoder emits ``<｜Assistant｜>`` plus ``<think>`` (thinking turn)
-    # or ``</think>`` (chat / dropped-thinking turn) after the user message;
-    # both are part of the generation prompt, not of the assistant's output.
-    "deepseek_v4": {
-        "assistant_header": "<｜Assistant｜>",
-        "end_marker": "<｜end▁of▁sentence｜>",
-        "skip_prefixes": ["<think>", "</think>"],
-    },
-}
-
-_PROBE_MESSAGES = [{"role": "user", "content": "probe"}]
-
-
-def resolve_loss_mask_config(mask_cfg: Mapping[str, Any] | None) -> dict[str, Any]:
-    """Resolve ``sft.loss_mask.preset`` to built-in template parameters.
-
-    The preset must be set explicitly: SFT only supports the chat-template
-    families in ``LOSS_MASK_PRESETS``.
-    """
-    preset = dict(mask_cfg or {}).get("preset")
-    if preset not in LOSS_MASK_PRESETS:
-        raise ValueError(
-            f"sft.loss_mask.preset must be set to one of {list(LOSS_MASK_PRESETS)}, got {preset!r}; "
-            "SFT supports only these chat-template families"
-        )
-    return dict(LOSS_MASK_PRESETS[preset], preset=preset)
+# One history and one final assistant turn.  Plain ASCII letters: no template
+# strips, splits or escapes them.
+_PROBE = [
+    {"role": "user", "content": "LSUSERPROBEA"},
+    {"role": "assistant", "content": "LSASSTPROBEA"},
+    {"role": "user", "content": "LSUSERPROBEB"},
+    {"role": "assistant", "content": "LSASSTPROBEB"},
+]
+_U1, _A1, _U2, _A2 = (message["content"] for message in _PROBE)
 
 
 class LossMaskGenerator:
     """Tokenize a conversation and mark the assistant tokens to train on."""
 
-    def __init__(
-        self,
-        tokenizer: Any,
-        mask_cfg: Mapping[str, Any] | None = None,
-        generation_prompt_kwargs: Mapping[str, Any] | None = None,
-    ):
+    def __init__(self, tokenizer: Any, generation_prompt_kwargs: Mapping[str, Any] | None = None):
         self.tokenizer = tokenizer
         self.template_kwargs = dict(generation_prompt_kwargs or {})
-        resolved = resolve_loss_mask_config(mask_cfg)
-        self.preset: str = resolved["preset"]
-        self.assistant_header: str = resolved["assistant_header"]
-        self.end_marker: str = resolved["end_marker"]
-        if resolved["skip_prefixes"] is None:
-            prefix = self._probe_generation_prefix()
-            resolved["skip_prefixes"] = [prefix] if prefix else []
-        self.skip_prefixes: list[str] = resolved["skip_prefixes"]
+        self.assistant_header, self.end_marker, self.skip_prefixes = self._probe_markers()
+        self._self_check()
 
     def _render(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None, **kwargs: Any) -> str:
         return self.tokenizer.apply_chat_template(
             messages, tools=tools, tokenize=False, **kwargs, **self.template_kwargs
         )
 
-    def _probe_generation_prefix(self) -> str:
-        """Text the template appends after ``assistant_header`` in the generation prompt.
+    def _probe_markers(self) -> tuple[str, str, list[str]]:
+        """Header / skip prefixes: common prefix of a history turn's opening and the
+        generation prompt, and what each adds beyond it (pre-filled at inference).
+        End marker: common prefix of the history and final turn's closing."""
+        full = self._render(_PROBE, None, add_generation_prompt=False)
+        gen = self._render(_PROBE[:1], None, add_generation_prompt=True)
+        # Raw probe renders, kept for logging what the markers were parsed from.
+        self.probe_full, self.probe_gen = full, gen
+        open_hist = full.partition(_U1)[2].partition(_A1)[0]
+        open_gen = gen.partition(_U1)[2]
+        opening = os.path.commonprefix([open_hist, open_gen])
+        skip_prefixes = sorted(
+            {text[len(opening):] for text in (open_hist, open_gen)} - {""},
+            key=lambda prefix: (-len(prefix), prefix),
+        )
 
-        Inference pre-fills it (e.g. Qwen3.5's ``<think>\\n``, or Qwen3's empty
-        think block with ``enable_thinking: false``), so the model must not be
-        trained to produce it.
+        # Drop the user turn's own closing (ChatML "<|im_end|>\n") so an assistant
+        # turn need not follow a user turn.  Strict prefix only: DeepSeek's encoder
+        # appends the generation prompt to a trailing user turn by itself.
+        user_tail = self._render(_PROBE[:1], None, add_generation_prompt=False).partition(_U1)[2]
+        header = opening
+        if len(user_tail) < len(opening) and opening.startswith(user_tail):
+            header = opening[len(user_tail):]
+
+        close_hist = full.partition(_A1)[2].partition(_U2)[0]
+        end_marker = os.path.commonprefix([close_hist, full.partition(_A2)[2]]).rstrip()
+        return header, end_marker, skip_prefixes
+
+    def _self_check(self) -> None:
+        """Mask the sentinel conversation and verify the trained spans.
+
+        Only the final turn's suffix is pinned: it may open with model output the
+        template renders for an empty reasoning block (DeepSeek's ``</think>``).
         """
-        text = self._render(_PROBE_MESSAGES, None, add_generation_prompt=True)
-        pos = text.rfind(self.assistant_header)
-        if pos < 0:
+        spans = decode_masked_spans(self.tokenizer, *self.generate(_PROBE))
+        history, final = _A1 + self.end_marker, _A2 + self.end_marker
+        if (
+            len(spans) != 2
+            or spans[0] != history
+            or not spans[1].endswith(final)
+            or any(user in span for span in spans for user in (_U1, _U2))
+        ):
             raise ValueError(
-                f"assistant_header {self.assistant_header!r} not found in the generation prompt "
-                f"{text!r}; set sft.loss_mask.preset to match a supported chat template"
+                f"loss-mask probe self-check failed: trained spans {spans!r}, expected "
+                f"[{history!r}, ...{final!r}] (assistant_header={self.assistant_header!r}, "
+                f"end_marker={self.end_marker!r}, skip_prefixes={self.skip_prefixes!r}); "
+                "chat template unsupported"
             )
-        return text[pos + len(self.assistant_header):]
 
     def generate(
         self,
@@ -142,7 +141,7 @@ class LossMaskGenerator:
             if header_pos < 0:
                 raise ValueError(
                     f"assistant message {index} has no {self.assistant_header!r} header in the rendered "
-                    "template; check sft.loss_mask against the chat template"
+                    "template; the conversation does not follow the probed chat-template layout"
                 )
             start = header_pos + len(self.assistant_header)
             end_pos = rendered.find(self.end_marker, start)

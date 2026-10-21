@@ -11,7 +11,6 @@ from coda.agentflow.loss_mask import (
     LossMaskGenerator,
     decode_masked_spans,
     get_response_length,
-    resolve_loss_mask_config,
 )
 from tests.ut.agentflow.fake_tokenizers import (
     FakeDeepSeekV4Tokenizer,
@@ -25,47 +24,30 @@ IM_END = "<|im_end|>"
 EOS = "<｜end▁of▁sentence｜>"
 
 
-def _spans(tokenizer, messages, tools=None, mask_cfg=None, **template_kwargs):
-    gen = LossMaskGenerator(tokenizer, mask_cfg or {"preset": "qwen"}, template_kwargs)
+def _spans(tokenizer, messages, tools=None, **template_kwargs):
+    gen = LossMaskGenerator(tokenizer, template_kwargs)
     ids, mask = gen.generate(messages, tools=tools)
     assert len(ids) == len(mask)
     return decode_masked_spans(tokenizer, ids, mask)
 
 
 # ---------------------------------------------------------------------------
-# Preset resolution
+# Marker probing
 # ---------------------------------------------------------------------------
 
-def test_explicit_presets_resolve():
-    assert resolve_loss_mask_config({"preset": "qwen"})["preset"] == "qwen"
-    assert resolve_loss_mask_config({"preset": "deepseek_v4"})["preset"] == "deepseek_v4"
-
-
-@pytest.mark.parametrize("cfg", [None, {}, {"preset": None}, {"preset": "auto"}, {"preset": "llama"}])
-def test_preset_must_be_explicit(cfg):
-    """There is no auto-detection: an unset or unsupported preset is an error."""
-    with pytest.raises(ValueError, match="sft.loss_mask.preset"):
-        resolve_loss_mask_config(cfg)
-
-
 def test_qwen_skip_prefix_probed_from_generation_prompt():
-    gen = LossMaskGenerator(FakeQwenTokenizer(), {"preset": "qwen"})
+    gen = LossMaskGenerator(FakeQwenTokenizer())
     assert gen.skip_prefixes == ["<think>\n"]
 
 
 def test_qwen_no_prefill_probes_no_skip_prefix():
-    gen = LossMaskGenerator(FakeQwenNoPrefillTokenizer(), {"preset": "qwen"})
+    gen = LossMaskGenerator(FakeQwenNoPrefillTokenizer())
     assert gen.skip_prefixes == []
 
 
 def test_qwen_thinking_off_probes_empty_think_block():
-    gen = LossMaskGenerator(FakeQwenThinkingOffTokenizer(), {"preset": "qwen"})
+    gen = LossMaskGenerator(FakeQwenThinkingOffTokenizer())
     assert gen.skip_prefixes == ["<think>\n\n</think>\n\n"]
-
-
-def test_probe_raises_when_header_absent_from_template():
-    with pytest.raises(ValueError, match="not found in the generation prompt"):
-        LossMaskGenerator(FakeDeepSeekV4Tokenizer(), {"preset": "qwen"})
 
 
 # ---------------------------------------------------------------------------
@@ -162,12 +144,6 @@ def test_end_marker_literal_in_content_closes_span_early():
     assert _spans(FakeQwenTokenizer(), messages) == ["say " + IM_END]
 
 
-def test_mismatched_header_raises():
-    messages = [{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"}]
-    with pytest.raises(ValueError, match="assistant message 1 has no"):
-        _spans(FakeQwenTokenizer(), messages, mask_cfg={"preset": "deepseek_v4"})
-
-
 def test_missing_offsets_raises():
     messages = [{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"}]
     with pytest.raises(ValueError, match="fast tokenizer"):
@@ -208,9 +184,6 @@ def test_token_straddling_skip_prefix_seam_is_trained():
 # DeepSeek-V4 official encoder layout
 # ---------------------------------------------------------------------------
 
-DEEPSEEK = {"preset": "deepseek_v4"}
-
-
 def test_deepseek_chat_mode_skips_think_end_token():
     messages = [
         {"role": "user", "content": "q1"},
@@ -218,7 +191,7 @@ def test_deepseek_chat_mode_skips_think_end_token():
         {"role": "user", "content": "q2"},
         {"role": "assistant", "content": "a2"},
     ]
-    assert _spans(FakeDeepSeekV4Tokenizer(), messages, mask_cfg=DEEPSEEK) == ["a1" + EOS, "a2" + EOS]
+    assert _spans(FakeDeepSeekV4Tokenizer(), messages) == ["a1" + EOS, "a2" + EOS]
 
 
 def test_deepseek_thinking_mode_trains_reasoning():
@@ -226,7 +199,7 @@ def test_deepseek_thinking_mode_trains_reasoning():
         {"role": "user", "content": "q"},
         {"role": "assistant", "content": "a", "reasoning_content": "r"},
     ]
-    assert _spans(FakeDeepSeekV4Tokenizer(), messages, mask_cfg=DEEPSEEK, thinking=True) == ["r</think>a" + EOS]
+    assert _spans(FakeDeepSeekV4Tokenizer(), messages, thinking=True) == ["r</think>a" + EOS]
 
 
 MULTI_TURN_REASONING = [
@@ -239,14 +212,14 @@ MULTI_TURN_REASONING = [
 
 def test_deepseek_drop_thinking_trains_only_last_turn_reasoning():
     """No tools: history turns open with "</think>" (reasoning dropped), the last with "<think>"."""
-    spans = _spans(FakeDeepSeekV4Tokenizer(), MULTI_TURN_REASONING, mask_cfg=DEEPSEEK, thinking=True)
+    spans = _spans(FakeDeepSeekV4Tokenizer(), MULTI_TURN_REASONING, thinking=True)
     assert spans == ["a1" + EOS, "r2</think>a2" + EOS]
 
 
 def test_deepseek_tools_keep_reasoning_on_every_turn():
     tools = [{"type": "function", "function": {"name": "f"}}]
     spans = _spans(
-        FakeDeepSeekV4Tokenizer(), MULTI_TURN_REASONING, tools=tools, mask_cfg=DEEPSEEK, thinking=True
+        FakeDeepSeekV4Tokenizer(), MULTI_TURN_REASONING, tools=tools, thinking=True
     )
     assert spans == ["r1</think>a1" + EOS, "r2</think>a2" + EOS]
 
@@ -258,7 +231,7 @@ def test_deepseek_tool_result_turns_are_context_only():
         {"role": "tool", "content": "OUT"},
         {"role": "assistant", "content": "final"},
     ]
-    assert _spans(FakeDeepSeekV4Tokenizer(), messages, mask_cfg=DEEPSEEK) == ["call" + EOS, "final" + EOS]
+    assert _spans(FakeDeepSeekV4Tokenizer(), messages) == ["call" + EOS, "final" + EOS]
 
 
 # ---------------------------------------------------------------------------
@@ -267,14 +240,14 @@ def test_deepseek_tool_result_turns_are_context_only():
 
 @pytest.mark.skipif(
     not os.environ.get("CODA_SFT_REAL_TOKENIZER"),
-    reason="set CODA_SFT_REAL_TOKENIZER=<hf tokenizer dir> (and CODA_SFT_REAL_PRESET) to run",
+    reason="set CODA_SFT_REAL_TOKENIZER=<hf tokenizer dir> to run",
 )
 def test_real_tokenizer_trains_end_marker_but_not_prefill():
     transformers = pytest.importorskip("transformers")
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         os.environ["CODA_SFT_REAL_TOKENIZER"], trust_remote_code=True
     )
-    gen = LossMaskGenerator(tokenizer, {"preset": os.environ.get("CODA_SFT_REAL_PRESET", "qwen")})
+    gen = LossMaskGenerator(tokenizer)
     messages = [
         {"role": "user", "content": "What is 2+2?"},
         {"role": "assistant", "content": "4"},

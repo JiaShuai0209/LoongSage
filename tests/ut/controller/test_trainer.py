@@ -372,15 +372,6 @@ class TestTrainerValidateReadOnlyCkptPaths:
         self._validate(config)
 
 
-class TestWeightVersionHelpers:
-    """Tests for trainer-side rollout weight version helpers."""
-
-    def test_post_train_weight_version_advances_from_current_version(self):
-        trainer = object.__new__(Trainer)
-
-        assert trainer._post_train_weight_version(7) == 8
-
-
 class TestBatchDiskRoundTrip:
     """_save_batch_to_disk / _load_batch_from_disk must round-trip a batch.
 

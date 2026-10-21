@@ -22,8 +22,6 @@ SFT_OVERRIDES = {
     "algorithm": {"policy_loss": "sft", "advantage_estimator": "sft"},
     "trainer": {"use_rollout_log_probs": True},
     "data_source": {"num_trajectories_per_prompt": 1},
-    # ``sft.loss_mask.preset`` has no default: it must be set per model.
-    "sft": {"loss_mask": {"preset": "qwen"}},
 }
 
 
@@ -424,13 +422,11 @@ def test_deepseek_thinking_multi_turn_uses_generation_prompt_kwargs():
         {"role": "assistant", "content": "a2", "reasoning_content": "r2"},
     ]
     config = make_sft_config(
-        sft={"loss_mask": {"preset": "deepseek_v4"}},
         agentflow={"tokenizer": {"generation_prompt_kwargs": {"thinking": True}}},
     )
     sampler = SFTSampler(config, [FakeDataSource([make_group(messages)])], tokenizer=tokenizer)
     traj = sampler(step=1)[0].trajectories[0]
 
-    assert sampler.mask_generator.preset == "deepseek_v4"
     assert traj.tokens == tokenizer.apply_chat_template(messages, thinking=True)
     # No tools, so drop_thinking is on: the history turn's reasoning is dropped and
     # it opens with the generation-prompt "</think>"; only the final turn keeps its

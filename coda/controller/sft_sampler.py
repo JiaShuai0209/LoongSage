@@ -121,15 +121,18 @@ class SFTSampler:
         self.max_seq_len = sft_cfg.get("max_seq_len")
         self.mask_generator = LossMaskGenerator(
             tokenizer,
-            sft_cfg.get("loss_mask"),
             dict(tokenizer_cfg.generation_prompt_kwargs or {}),
         )
         self._logged_sample = False
         # {step: sft/* summary}; like RolloutSampler.metrics, only the current step is kept.
         self.metrics: dict[int, dict[str, float]] = {}
         logger.info(
-            "[sft] loss mask preset=%s header=%r end=%r skip_prefixes=%r max_seq_len=%s",
-            self.mask_generator.preset,
+            "[sft] loss mask probe renders: full=%r gen=%r",
+            self.mask_generator.probe_full,
+            self.mask_generator.probe_gen,
+        )
+        logger.info(
+            "[sft] loss mask probed from chat template: header=%r end=%r skip_prefixes=%r max_seq_len=%s",
             self.mask_generator.assistant_header,
             self.mask_generator.end_marker,
             self.mask_generator.skip_prefixes,
