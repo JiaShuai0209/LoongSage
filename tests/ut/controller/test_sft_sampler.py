@@ -9,27 +9,26 @@ from pathlib import Path
 import pytest
 from omegaconf import OmegaConf
 
-from coda.agentflow.loss_mask import decode_masked_spans
+from coda.agentflow.sft_tokenizer import decode_trainable_spans
 from coda.agentflow.trajectory_store import Trajectory, TrajectoryGroup, TrajectoryStatus
-from coda.controller.sft_sampler import SFTSampler, validate_sft_config
+from coda.controller.sft_sampler import SFTSampler, apply_sft_forced_settings, validate_sft_config
 from tests.ut.agentflow.fake_tokenizers import FakeDeepSeekV4Tokenizer, FakeQwenTokenizer
 
 DEFAULT_YAML = Path(__file__).resolve().parents[3] / "conf" / "default.yaml"
 
 SFT_OVERRIDES = {
     "run_mode": "sft",
-    "colocate": False,
     "algorithm": {"policy_loss": "sft", "advantage_estimator": "sft"},
-    "trainer": {"use_rollout_log_probs": True},
     "data_source": {"num_trajectories_per_prompt": 1},
-    # ``sft.loss_mask.preset`` has no default: it must be set per model.
-    "sft": {"loss_mask": {"preset": "qwen"}},
 }
 
 
 def make_sft_config(**overrides):
     cfg = OmegaConf.merge(OmegaConf.load(DEFAULT_YAML), SFT_OVERRIDES, overrides)
     OmegaConf.resolve(cfg)
+    # As trainer.normalize_data_sources does (not imported: trainer pulls in Megatron):
+    # every data_sources entry inherits the data_source defaults.
+    cfg.data_sources = [OmegaConf.merge(cfg.data_source, ds) for ds in cfg.data_sources]
     return cfg
 
 
@@ -53,9 +52,11 @@ def tracked(monkeypatch):
     return calls
 
 
-def make_sampler(groups=(), **sft_cfg):
+def make_sampler(groups=(), max_seq_len=None):
     return SFTSampler(
-        make_sft_config(sft=sft_cfg), [FakeDataSource(list(groups))], tokenizer=FakeQwenTokenizer()
+        make_sft_config(data_source={"sft_max_seq_len": max_seq_len}),
+        [FakeDataSource(list(groups))],
+        tokenizer=FakeQwenTokenizer(),
     )
 
 
@@ -70,9 +71,9 @@ def make_group(messages, metadata=None, prompt_id="p0", ds_index=0):
     return TrajectoryGroup(prompt_id=prompt_id, trajectories=[traj])
 
 
-def sample_one(group, **sft_cfg):
+def sample_one(group, max_seq_len=None):
     """Run one SFTSampler step over a single group; returns ``(sampler, trajectory)``."""
-    sampler = make_sampler([group], **sft_cfg)
+    sampler = make_sampler([group], max_seq_len=max_seq_len)
     return sampler, sampler(step=1)[0].trajectories[0]
 
 
@@ -91,7 +92,7 @@ def decode(ids):
 
 def trained_spans(traj):
     """Contiguous trained runs of the response slice, decoded."""
-    return decode_masked_spans(FakeQwenTokenizer(), *response_slice(traj))
+    return decode_trainable_spans(FakeQwenTokenizer(), *response_slice(traj))
 
 
 IM_END = "<|im_end|>"
@@ -405,7 +406,7 @@ def test_first_token_is_never_trained(monkeypatch):
     messages = [{"role": "assistant", "content": "ab"}]
     sampler = make_sampler([make_group(messages)])
     monkeypatch.setattr(
-        sampler.mask_generator, "generate", lambda messages, tools=None: ([ord("a"), ord("b")], [1, 1])
+        sampler.sft_tokenizer, "tokenize", lambda messages, tools=None: ([ord("a"), ord("b")], [1, 1])
     )
     traj = sampler(step=1)[0].trajectories[0]
 
@@ -424,13 +425,11 @@ def test_deepseek_thinking_multi_turn_uses_generation_prompt_kwargs():
         {"role": "assistant", "content": "a2", "reasoning_content": "r2"},
     ]
     config = make_sft_config(
-        sft={"loss_mask": {"preset": "deepseek_v4"}},
         agentflow={"tokenizer": {"generation_prompt_kwargs": {"thinking": True}}},
     )
     sampler = SFTSampler(config, [FakeDataSource([make_group(messages)])], tokenizer=tokenizer)
     traj = sampler(step=1)[0].trajectories[0]
 
-    assert sampler.mask_generator.preset == "deepseek_v4"
     assert traj.tokens == tokenizer.apply_chat_template(messages, thinking=True)
     # No tools, so drop_thinking is on: the history turn's reasoning is dropped and
     # it opens with the generation-prompt "</think>"; only the final turn keeps its
@@ -461,6 +460,23 @@ def test_call_concatenates_datasources_in_config_order():
     assert [trained_spans(g.trajectories[0]) for g in groups] == [
         ["a1" + IM_END, "a2" + IM_END], [], AGENTIC_SPANS,
     ]
+
+
+def test_sft_max_seq_len_applies_per_data_source():
+    """Each data source cuts its own conversations; the clip ratio counts both."""
+    full = len(FakeQwenTokenizer().apply_chat_template(MESSAGES))
+    ds_a = FakeDataSource([make_group(MESSAGES, prompt_id="a0")])
+    ds_b = FakeDataSource([make_group(MESSAGES, prompt_id="b0", ds_index=1)])
+    config = make_sft_config(data_sources=[
+        {"num_prompts_per_step": 1, "num_trajectories_per_prompt": 1, "sft_max_seq_len": full - 1},
+        {"num_prompts_per_step": 1, "num_trajectories_per_prompt": 1, "sft_max_seq_len": None},
+    ])
+    sampler = SFTSampler(config, [ds_a, ds_b], tokenizer=FakeQwenTokenizer())
+
+    groups = sampler(step=1)
+
+    assert [len(g.trajectories[0].tokens) for g in groups] == [full - 1, full]
+    assert sampler.metrics[1]["sft/seq_length_clip_ratio"] == 0.5
 
 
 def test_datasource_count_must_match_config():
@@ -533,14 +549,14 @@ def test_mixed_batch_flattens_to_one_training_row_per_conversation(monkeypatch):
             resp_len = shard["response_lengths"][i]
             assert shard["total_lengths"][i] == len(tokens)
             assert resp_len == len(mask) == len(shard["rollout_log_probs"][i]) == len(shard["token_rewards"][i])
-            rows[prompt_id] = decode_masked_spans(
+            rows[prompt_id] = decode_trainable_spans(
                 FakeQwenTokenizer(), tokens[-resp_len:].tolist(), mask.tolist()
             )
     assert rows == expected
 
 
 # ---------------------------------------------------------------------------
-# validate_sft_config
+# apply_sft_forced_settings / validate_sft_config
 # ---------------------------------------------------------------------------
 
 def test_valid_sft_config_passes():
@@ -561,12 +577,28 @@ def test_second_datasource_with_multiple_trajectories_raises():
 
 
 @pytest.mark.parametrize(
+    "overrides, logged",
+    [
+        # default.yaml has colocate=true / use_rollout_log_probs=false
+        ({}, "colocate=False (was True), trainer.use_rollout_log_probs=True (was False)"),
+        ({"colocate": False, "trainer": {"use_rollout_log_probs": True}},
+         "colocate=False, trainer.use_rollout_log_probs=True"),
+    ],
+)
+def test_sft_forced_settings_are_set_and_logged(overrides, logged, caplog):
+    config = make_sft_config(**overrides)
+    with caplog.at_level(logging.INFO, logger="coda.controller.sft_sampler"):
+        apply_sft_forced_settings(config)
+    assert config.colocate is False
+    assert config.trainer.use_rollout_log_probs is True
+    assert any(r.getMessage() == f"[sft] run_mode=sft sets: {logged}" for r in caplog.records)
+
+
+@pytest.mark.parametrize(
     "overrides, match",
     [
         ({"algorithm": {"policy_loss": "grpo"}}, "policy_loss=sft"),
         ({"algorithm": {"advantage_estimator": "grpo"}}, "advantage_estimator=sft"),
-        ({"trainer": {"use_rollout_log_probs": False}}, "use_rollout_log_probs=true"),
-        ({"colocate": True}, "colocate"),
         ({"algorithm": {"ref_kl": {"enable": True}}}, "algorithm.ref_kl.enable"),
         ({"algorithm": {"is_correction": {"enable": True}}}, "algorithm.is_correction.enable"),
         ({"algorithm": {"m2po": {"enable": True}}}, "algorithm.m2po.enable"),

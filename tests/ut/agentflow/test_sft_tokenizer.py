@@ -1,17 +1,16 @@
-"""Unit tests for coda.agentflow.loss_mask.
+"""Unit tests for coda.agentflow.sft_tokenizer.
 
-Run: python -m pytest tests/ut/agentflow/test_loss_mask.py -v
+Run: python -m pytest tests/ut/agentflow/test_sft_tokenizer.py -v
 """
 
 import os
 
 import pytest
 
-from coda.agentflow.loss_mask import (
-    LossMaskGenerator,
-    decode_masked_spans,
-    get_response_length,
-    resolve_loss_mask_config,
+from coda.agentflow.sft_tokenizer import (
+    SFTTokenizer,
+    decode_trainable_spans,
+    trainable_suffix_length,
 )
 from tests.ut.agentflow.fake_tokenizers import (
     FakeDeepSeekV4Tokenizer,
@@ -25,47 +24,30 @@ IM_END = "<|im_end|>"
 EOS = "<｜end▁of▁sentence｜>"
 
 
-def _spans(tokenizer, messages, tools=None, mask_cfg=None, **template_kwargs):
-    gen = LossMaskGenerator(tokenizer, mask_cfg or {"preset": "qwen"}, template_kwargs)
-    ids, mask = gen.generate(messages, tools=tools)
+def _spans(tokenizer, messages, tools=None, **template_kwargs):
+    sft_tok = SFTTokenizer(tokenizer, template_kwargs)
+    ids, mask = sft_tok.tokenize(messages, tools=tools)
     assert len(ids) == len(mask)
-    return decode_masked_spans(tokenizer, ids, mask)
+    return decode_trainable_spans(tokenizer, ids, mask)
 
 
 # ---------------------------------------------------------------------------
-# Preset resolution
+# Marker probing
 # ---------------------------------------------------------------------------
-
-def test_explicit_presets_resolve():
-    assert resolve_loss_mask_config({"preset": "qwen"})["preset"] == "qwen"
-    assert resolve_loss_mask_config({"preset": "deepseek_v4"})["preset"] == "deepseek_v4"
-
-
-@pytest.mark.parametrize("cfg", [None, {}, {"preset": None}, {"preset": "auto"}, {"preset": "llama"}])
-def test_preset_must_be_explicit(cfg):
-    """There is no auto-detection: an unset or unsupported preset is an error."""
-    with pytest.raises(ValueError, match="sft.loss_mask.preset"):
-        resolve_loss_mask_config(cfg)
-
 
 def test_qwen_skip_prefix_probed_from_generation_prompt():
-    gen = LossMaskGenerator(FakeQwenTokenizer(), {"preset": "qwen"})
-    assert gen.skip_prefixes == ["<think>\n"]
+    sft_tok = SFTTokenizer(FakeQwenTokenizer())
+    assert sft_tok.skip_prefixes == ["<think>\n"]
 
 
 def test_qwen_no_prefill_probes_no_skip_prefix():
-    gen = LossMaskGenerator(FakeQwenNoPrefillTokenizer(), {"preset": "qwen"})
-    assert gen.skip_prefixes == []
+    sft_tok = SFTTokenizer(FakeQwenNoPrefillTokenizer())
+    assert sft_tok.skip_prefixes == []
 
 
 def test_qwen_thinking_off_probes_empty_think_block():
-    gen = LossMaskGenerator(FakeQwenThinkingOffTokenizer(), {"preset": "qwen"})
-    assert gen.skip_prefixes == ["<think>\n\n</think>\n\n"]
-
-
-def test_probe_raises_when_header_absent_from_template():
-    with pytest.raises(ValueError, match="not found in the generation prompt"):
-        LossMaskGenerator(FakeDeepSeekV4Tokenizer(), {"preset": "qwen"})
+    sft_tok = SFTTokenizer(FakeQwenThinkingOffTokenizer())
+    assert sft_tok.skip_prefixes == ["<think>\n\n</think>\n\n"]
 
 
 # ---------------------------------------------------------------------------
@@ -162,12 +144,6 @@ def test_end_marker_literal_in_content_closes_span_early():
     assert _spans(FakeQwenTokenizer(), messages) == ["say " + IM_END]
 
 
-def test_mismatched_header_raises():
-    messages = [{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"}]
-    with pytest.raises(ValueError, match="assistant message 1 has no"):
-        _spans(FakeQwenTokenizer(), messages, mask_cfg={"preset": "deepseek_v4"})
-
-
 def test_missing_offsets_raises():
     messages = [{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"}]
     with pytest.raises(ValueError, match="fast tokenizer"):
@@ -208,9 +184,6 @@ def test_token_straddling_skip_prefix_seam_is_trained():
 # DeepSeek-V4 official encoder layout
 # ---------------------------------------------------------------------------
 
-DEEPSEEK = {"preset": "deepseek_v4"}
-
-
 def test_deepseek_chat_mode_skips_think_end_token():
     messages = [
         {"role": "user", "content": "q1"},
@@ -218,7 +191,7 @@ def test_deepseek_chat_mode_skips_think_end_token():
         {"role": "user", "content": "q2"},
         {"role": "assistant", "content": "a2"},
     ]
-    assert _spans(FakeDeepSeekV4Tokenizer(), messages, mask_cfg=DEEPSEEK) == ["a1" + EOS, "a2" + EOS]
+    assert _spans(FakeDeepSeekV4Tokenizer(), messages) == ["a1" + EOS, "a2" + EOS]
 
 
 def test_deepseek_thinking_mode_trains_reasoning():
@@ -226,7 +199,7 @@ def test_deepseek_thinking_mode_trains_reasoning():
         {"role": "user", "content": "q"},
         {"role": "assistant", "content": "a", "reasoning_content": "r"},
     ]
-    assert _spans(FakeDeepSeekV4Tokenizer(), messages, mask_cfg=DEEPSEEK, thinking=True) == ["r</think>a" + EOS]
+    assert _spans(FakeDeepSeekV4Tokenizer(), messages, thinking=True) == ["r</think>a" + EOS]
 
 
 MULTI_TURN_REASONING = [
@@ -239,14 +212,14 @@ MULTI_TURN_REASONING = [
 
 def test_deepseek_drop_thinking_trains_only_last_turn_reasoning():
     """No tools: history turns open with "</think>" (reasoning dropped), the last with "<think>"."""
-    spans = _spans(FakeDeepSeekV4Tokenizer(), MULTI_TURN_REASONING, mask_cfg=DEEPSEEK, thinking=True)
+    spans = _spans(FakeDeepSeekV4Tokenizer(), MULTI_TURN_REASONING, thinking=True)
     assert spans == ["a1" + EOS, "r2</think>a2" + EOS]
 
 
 def test_deepseek_tools_keep_reasoning_on_every_turn():
     tools = [{"type": "function", "function": {"name": "f"}}]
     spans = _spans(
-        FakeDeepSeekV4Tokenizer(), MULTI_TURN_REASONING, tools=tools, mask_cfg=DEEPSEEK, thinking=True
+        FakeDeepSeekV4Tokenizer(), MULTI_TURN_REASONING, tools=tools, thinking=True
     )
     assert spans == ["r1</think>a1" + EOS, "r2</think>a2" + EOS]
 
@@ -258,7 +231,7 @@ def test_deepseek_tool_result_turns_are_context_only():
         {"role": "tool", "content": "OUT"},
         {"role": "assistant", "content": "final"},
     ]
-    assert _spans(FakeDeepSeekV4Tokenizer(), messages, mask_cfg=DEEPSEEK) == ["call" + EOS, "final" + EOS]
+    assert _spans(FakeDeepSeekV4Tokenizer(), messages) == ["call" + EOS, "final" + EOS]
 
 
 # ---------------------------------------------------------------------------
@@ -267,31 +240,31 @@ def test_deepseek_tool_result_turns_are_context_only():
 
 @pytest.mark.skipif(
     not os.environ.get("CODA_SFT_REAL_TOKENIZER"),
-    reason="set CODA_SFT_REAL_TOKENIZER=<hf tokenizer dir> (and CODA_SFT_REAL_PRESET) to run",
+    reason="set CODA_SFT_REAL_TOKENIZER=<hf tokenizer dir> to run",
 )
 def test_real_tokenizer_trains_end_marker_but_not_prefill():
     transformers = pytest.importorskip("transformers")
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         os.environ["CODA_SFT_REAL_TOKENIZER"], trust_remote_code=True
     )
-    gen = LossMaskGenerator(tokenizer, {"preset": os.environ.get("CODA_SFT_REAL_PRESET", "qwen")})
+    sft_tok = SFTTokenizer(tokenizer)
     messages = [
         {"role": "user", "content": "What is 2+2?"},
         {"role": "assistant", "content": "4"},
         {"role": "user", "content": "And 3+3?"},
         {"role": "assistant", "content": "6"},
     ]
-    ids, mask = gen.generate(messages)
-    spans = decode_masked_spans(tokenizer, ids, mask)
+    ids, mask = sft_tok.tokenize(messages)
+    spans = decode_trainable_spans(tokenizer, ids, mask)
 
     # One span per assistant turn, each ending with the end marker so the model
     # learns to stop; neither the header nor a pre-filled prefix is trained.
     assert len(spans) == 2
     for span, answer in zip(spans, ("4", "6")):
-        assert span.endswith(gen.end_marker)
+        assert span.endswith(sft_tok.end_marker)
         assert answer in span
-        assert gen.assistant_header not in span
-        assert not any(span.startswith(prefix) for prefix in gen.skip_prefixes)
+        assert sft_tok.assistant_header not in span
+        assert not any(span.startswith(prefix) for prefix in sft_tok.skip_prefixes)
 
 
 # ---------------------------------------------------------------------------
@@ -302,5 +275,5 @@ def test_real_tokenizer_trains_end_marker_but_not_prefill():
     "mask, expected",
     [([0, 0, 1, 0, 1], 3), ([1, 1], 2), ([0, 0], 0), ([], 0)],
 )
-def test_get_response_length(mask, expected):
-    assert get_response_length(mask) == expected
+def test_trainable_suffix_length(mask, expected):
+    assert trainable_suffix_length(mask) == expected

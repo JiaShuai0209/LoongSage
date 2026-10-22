@@ -61,6 +61,8 @@ data_source:
     name: ???
   teacher_name: ""
   max_response_len_per_trajectory: 32768  # cap on response-area tokens (LLM replies + tool responses) per attempt. Single-turn uses this as request max_tokens; multi-turn agents receive it and choose their own per-call max_tokens.
+  # run_mode=sft only: keep the first sft_max_seq_len tokens of each rendered conversation (null = no limit).
+  sft_max_seq_len: null
   num_prompts_per_step: 64
   num_trajectories_per_prompt: 8
   completion_params: {}
@@ -145,20 +147,6 @@ agentflow:
     manager:
       mode: thread
       num_workers: 8
-
-# Only read when run_mode=sft. Each dataset row's input_key holds the full conversation
-# (OpenAI-style message list); assistant turns are trained, everything else is context.
-# An assistant message with "step_loss_mask": 0 stays in context but is not trained on.
-sft:
-  max_seq_len: null       # truncate rendered conversations to this many tokens; null = no limit
-  loss_mask:
-    # Built-in preset for locating assistant turns in the rendered chat template.
-    # Must be set explicitly per model; there is no auto-detection:
-    #   qwen         ChatML Qwen2.5/3/3.5 checkpoints. The thinking prefix is probed
-    #                from the active template, so one preset covers both thinking modes.
-    #   deepseek_v4  DeepSeek-V4/V4.1 checkpoints rendered by the official encoder.
-    # Other chat templates are not supported by run_mode=sft.
-    preset: null          # qwen|deepseek_v4
 
 tracking:
   project_name: "default"

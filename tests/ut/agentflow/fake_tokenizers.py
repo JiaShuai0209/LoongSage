@@ -12,6 +12,10 @@ against the real templates:
   * DeepSeek-V4 (sglang ``encoding_dsv4``): thinking is dropped for turns at or
     before the last user turn unless tools are present, so history turns open
     with ``</think>`` and the final turn opens with ``<think>``.
+
+The ``FakeQwen3`` / ``FakeDeepSeekV41`` / ``FakeLlama3`` / ``FakePlainText`` classes at the
+end back ``test_sft_tokenizer_probe.py``; see each docstring for how it differs from the
+similarly named class above.
 """
 
 from __future__ import annotations
@@ -61,7 +65,7 @@ class FakeQwenTokenizer(FakeCharTokenizer):
     """Qwen3.5-like: the generation prompt pre-fills ``gen_prompt_suffix``.
 
     Qwen3.5 pre-fills ``<think>\\n``; Qwen3 pre-fills ``""`` with thinking on, or
-    the empty think block with ``enable_thinking: false``.  The loss mask probes
+    the empty think block with ``enable_thinking: false``.  ``SFTTokenizer`` probes
     this suffix at runtime, so overriding it exercises the probe branches.
     """
 
@@ -204,3 +208,100 @@ class FakeMergingTokenizer(FakeQwenTokenizer):
         # Not dict.get(t, chr(t)): the chr() default would be evaluated for fused
         # ids too (which are out of chr()'s range) and raise.
         return "".join(self._id2str[t] if t in self._id2str else chr(t) for t in token_ids)
+
+
+# ---------------------------------------------------------------------------
+# Probe-test templates: renders pinned against the real Qwen3 / DeepSeek-V4.1 / Llama-3 layouts.
+# ---------------------------------------------------------------------------
+
+QWEN_IM_END = "<|im_end|>"
+DS_BOS = "<｜begin▁of▁sentence｜>"
+DS_EOS = "<｜end▁of▁sentence｜>"
+DS_EFFORT = "Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n"
+
+
+
+class FakeQwen3Tokenizer(FakeCharTokenizer):
+    """Qwen3 (e.g. Qwen3-4B): turns after the last user turn always get a think block.
+
+    History turns render without one; the final turn renders ``<think>\\n{reasoning}\\n</think>\\n\\n``
+    even when the reasoning is empty.  ``enable_thinking=False`` only changes the
+    generation prompt, which then pre-fills the empty think block.
+
+    Unlike ``FakeQwenTokenizer`` (Qwen3.5-like: the generation prompt pre-fills
+    ``gen_prompt_suffix`` and a think block is rendered only when there is reasoning),
+    this pins the real Qwen3 renders used by ``test_sft_tokenizer_probe.py``.
+    """
+
+    def render(self, messages, tools, add_generation_prompt, **kwargs) -> str:
+        last_user = self._last_user_index(messages)
+        out = ""
+        for index, msg in enumerate(messages):
+            role, content = msg["role"], msg.get("content") or ""
+            if role == "assistant" and index > last_user:
+                reasoning = (msg.get("reasoning_content") or "").strip()
+                content = f"<think>\n{reasoning}\n</think>\n\n{content}"
+            out += f"<|im_start|>{role}\n{content}{QWEN_IM_END}\n"
+        if add_generation_prompt:
+            out += "<|im_start|>assistant\n"
+            if kwargs.get("enable_thinking") is False:
+                out += "<think>\n\n</think>\n\n"
+        return out
+
+
+class FakeDeepSeekV41Tokenizer(FakeCharTokenizer):
+    """DeepSeek-V4.1 official encoder: no ChatML, special tokens back to back.
+
+    The ``<｜Assistant｜>`` header plus a think token follows each user turn.  Chat mode
+    always uses ``</think>``.  Thinking mode prepends a reasoning-effort system prefix,
+    drops reasoning on turns before the last user turn (they open with ``</think>``)
+    and opens the final turn with ``<think>{reasoning}</think>``.
+
+    Unlike ``FakeDeepSeekV4Tokenizer`` (V4: no ``<｜System｜>`` token, no reasoning-effort
+    prefix, tool-aware ``drop_thinking``), this pins the real V4.1 renders used by
+    ``test_sft_tokenizer_probe.py`` and ignores tools.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(model_family="deepseek_v41", **kwargs)
+
+    def render(self, messages, tools, add_generation_prompt, **kwargs) -> str:
+        thinking = bool(kwargs.get("thinking"))
+        last_user = self._last_user_index(messages)
+        system = "".join(m.get("content") or "" for m in messages if m["role"] == "system")
+        out = DS_BOS
+        if thinking or system:
+            out += "<｜System｜>" + (DS_EFFORT if thinking else "") + system
+        for index, msg in enumerate(messages):
+            role, content = msg["role"], msg.get("content") or ""
+            if role == "user":
+                out += f"<｜User｜>{content}"
+                if index + 1 < len(messages) and messages[index + 1]["role"] == "assistant":
+                    out += "<｜Assistant｜>" + ("<think>" if thinking and index + 1 > last_user else "</think>")
+            elif role == "assistant":
+                if thinking and index > last_user:
+                    out += f"{msg.get('reasoning_content') or ''}</think>"
+                out += f"{content}{DS_EOS}"
+        if add_generation_prompt:
+            out += "<｜Assistant｜>" + ("<think>" if thinking else "</think>")
+        return out
+
+
+class FakeLlama3Tokenizer(FakeCharTokenizer):
+    """Llama-3 style headers: ``<|start_header_id|>{role}<|end_header_id|>\\n\\n ... <|eot_id|>``."""
+
+    def render(self, messages, tools, add_generation_prompt, **kwargs) -> str:
+        out = "<|begin_of_text|>"
+        for msg in messages:
+            out += f"<|start_header_id|>{msg['role']}<|end_header_id|>\n\n{msg.get('content') or ''}<|eot_id|>"
+        if add_generation_prompt:
+            out += "<|start_header_id|>assistant<|end_header_id|>\n\n"
+        return out
+
+
+class FakePlainTextTokenizer(FakeCharTokenizer):
+    """``User: ... / Assistant: ...`` with no closing token: nothing marks where a reply ends."""
+
+    def render(self, messages, tools, add_generation_prompt, **kwargs) -> str:
+        out = "".join(f"{msg['role'].title()}: {msg.get('content') or ''}\n" for msg in messages)
+        return out + ("Assistant: " if add_generation_prompt else "")

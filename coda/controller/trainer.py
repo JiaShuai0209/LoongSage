@@ -22,7 +22,7 @@ from coda.data_factory.data_processor import (
 from coda.controller.train_manager import TrainManager
 from coda.controller.rollout_manager import RolloutManager
 from coda.controller.teacher_manager import TeacherManager
-from coda.controller.sft_sampler import SFTSampler, validate_sft_config
+from coda.controller.sft_sampler import SFTSampler, apply_sft_forced_settings, validate_sft_config
 from coda.transfer_mesh import ChannelMeta
 from coda.utils.checkpoint_utils import get_tracker_file, resolve_dist_ckpt_dir
 from coda.utils.tracking import configure_tracking, time_marker, TimeMarkerAcc, track
@@ -81,8 +81,11 @@ class Trainer:
             )
         self.dp_size = train_world_size // num_gpu_per_dp
         self.is_sft = Mode(self.config.run_mode) == Mode.SFT
+        if self.is_sft:
+            # Before validation and before anything reads colocate / use_rollout_log_probs.
+            apply_sft_forced_settings(self.config)
         self._validate_config()
-        self.is_colocated = self.config.colocate and not self.is_sft
+        self.is_colocated = self.config.colocate
         self.is_fully_async = self.config.fully_async.enable
         self.num_mini_batches = 0
         if self.is_fully_async:
@@ -411,7 +414,7 @@ class Trainer:
         """Bump the weight version and push the new weights to the rollout engines."""
         with time_marker("update_weights", step=step):
             channel_meta = self._init_channel_meta()
-            current_weight_version = self._post_train_weight_version(current_weight_version)
+            current_weight_version += 1
             self._update_weights(channel_meta, weight_version=current_weight_version)
         return current_weight_version
 
@@ -495,7 +498,7 @@ class Trainer:
                 with time_marker("train", step=step):
                     ray.get(self.train_manager.async_train(step, splited_batch_refs))
                                       
-                current_weight_version = self._post_train_weight_version(current_weight_version)
+                current_weight_version += 1
 
                 with time_marker("save_ckpt", step=step):
                     self.save_ckpt(step)
@@ -527,7 +530,7 @@ class Trainer:
                 with time_marker("train", step=step):
                     ray.get(self.train_manager.async_train(step, splited_batch_refs))
 
-                current_weight_version = self._post_train_weight_version(current_weight_version)
+                current_weight_version += 1
 
                 with time_marker("save_ckpt", step=step):
                     self.save_ckpt(step)
@@ -621,10 +624,6 @@ class Trainer:
         for ds in self.datasources:
             ds.load(saved_step)
         return saved_step
-
-    def _post_train_weight_version(self, current_weight_version: int) -> int:
-        """Return the rollout-visible model version after one training update."""
-        return current_weight_version + 1
 
     def save_ckpt(self, step: int) -> None:
         """Save on cadence or at the final step, so training always ends with a save."""
