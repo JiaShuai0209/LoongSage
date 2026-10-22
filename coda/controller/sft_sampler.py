@@ -12,15 +12,23 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 from coda.agentflow.tokenizer_manager import _load_chat_template, load_tokenizer
 from coda.agentflow.trajectory_store import Segment, Trajectory, TrajectoryGroup, TrajectoryStatus
-from coda.agentflow.loss_mask import LossMaskGenerator, decode_masked_spans, get_response_length
+from coda.agentflow.sft_tokenizer import SFTTokenizer, decode_trainable_spans, trainable_suffix_length
 from coda.data_factory.data_source import DataSource
 from coda.utils.tracking import track
 
 logger = logging.getLogger(__name__)
+
+# Values run_mode=sft implies; prepare_sft_config writes them into the config.
+SFT_FORCED_SETTINGS = {
+    # No rollout engine shares the GPUs, so colocate offload/onload is pure overhead.
+    "colocate": False,
+    # The sft loss ignores old log-probs; this skips the extra old-policy forward pass.
+    "trainer.use_rollout_log_probs": True,
+}
 
 
 def _summary_metrics(trajectories: list[Trajectory], num_truncated: int) -> dict[str, float]:
@@ -49,7 +57,7 @@ def _summary_metrics(trajectories: list[Trajectory], num_truncated: int) -> dict
         metrics[f"sft/{name}_mean"] = sum(values) / n
         metrics[f"sft/{name}_max"] = max(values)
         metrics[f"sft/{name}_min"] = min(values)
-    # Cut by sft.max_seq_len over the whole sequence, unlike rollout's
+    # Cut by data_source.max_seq_len over the whole sequence, unlike rollout's
     # response_length_clip_ratio (max_response_len_per_trajectory on the response).
     metrics["sft/seq_length_clip_ratio"] = num_truncated / n
     metrics["sft/trained_tokens"] = sum(trained)
@@ -58,25 +66,30 @@ def _summary_metrics(trajectories: list[Trajectory], num_truncated: int) -> dict
     return metrics
 
 
-def validate_sft_config(config: DictConfig) -> None:
-    """Reject settings that need rollout data or a reward the SFT path does not produce.
+def prepare_sft_config(config: DictConfig) -> None:
+    """Apply ``SFT_FORCED_SETTINGS`` in place, then reject settings SFT cannot honour.
 
     Raises:
         ValueError: On the first incompatible setting.
     """
+    applied = []
+    for key, value in SFT_FORCED_SETTINGS.items():
+        previous = OmegaConf.select(config, key)
+        OmegaConf.update(config, key, value)
+        applied.append(f"{key}={value}" + ("" if previous == value else f" (was {previous})"))
+    logger.info("[sft] run_mode=sft sets: %s", ", ".join(applied))
+
+    # Silently ignored otherwise (the config is not struct), which would disable truncation.
+    if OmegaConf.select(config, "sft.max_seq_len") is not None:
+        raise ValueError("sft.max_seq_len has moved to data_source.max_seq_len (per data source)")
+
     algorithm = config.algorithm
     if algorithm.policy_loss != "sft" or algorithm.advantage_estimator != "sft":
         raise ValueError(
             "run_mode=sft requires algorithm.policy_loss=sft and algorithm.advantage_estimator=sft, "
             f"got {algorithm.policy_loss!r} / {algorithm.advantage_estimator!r}"
         )
-    if not config.trainer.use_rollout_log_probs:
-        raise ValueError(
-            "run_mode=sft requires trainer.use_rollout_log_probs=true (skips the old-log-prob forward pass)"
-        )
     disabled = {
-        # No rollout engines share the GPUs, so colocate offload/onload is pure overhead.
-        "colocate": config.colocate,
         "algorithm.ref_kl.enable": algorithm.ref_kl.enable,
         "algorithm.is_correction.enable": algorithm.is_correction.enable,
         "algorithm.m2po.enable": algorithm.m2po.enable,
@@ -117,9 +130,7 @@ class SFTSampler:
                 _load_chat_template(tokenizer_cfg.custom_chat_template_path),
             )
         self.tokenizer = tokenizer
-        sft_cfg = config.get("sft") or {}
-        self.max_seq_len = sft_cfg.get("max_seq_len")
-        self.mask_generator = LossMaskGenerator(
+        self.sft_tokenizer = SFTTokenizer(
             tokenizer,
             dict(tokenizer_cfg.generation_prompt_kwargs or {}),
         )
@@ -127,16 +138,19 @@ class SFTSampler:
         # {step: sft/* summary}; like RolloutSampler.metrics, only the current step is kept.
         self.metrics: dict[int, dict[str, float]] = {}
         logger.info(
-            "[sft] loss mask probe renders: full=%r gen=%r",
-            self.mask_generator.probe_full,
-            self.mask_generator.probe_gen,
+            "[sft] chat template probe renders: full=%r gen=%r",
+            self.sft_tokenizer.probe_full,
+            self.sft_tokenizer.probe_gen,
         )
         logger.info(
-            "[sft] loss mask probed from chat template: header=%r end=%r skip_prefixes=%r max_seq_len=%s",
-            self.mask_generator.assistant_header,
-            self.mask_generator.end_marker,
-            self.mask_generator.skip_prefixes,
-            self.max_seq_len,
+            "[sft] markers probed from chat template: header=%r end=%r skip_prefixes=%r",
+            self.sft_tokenizer.assistant_header,
+            self.sft_tokenizer.end_marker,
+            self.sft_tokenizer.skip_prefixes,
+        )
+        logger.info(
+            "[sft] max_seq_len per data source: %s",
+            [ds_cfg.get("max_seq_len") for ds_cfg in config.data_sources],
         )
 
     def __call__(self, step: int) -> list[TrajectoryGroup]:
@@ -146,15 +160,16 @@ class SFTSampler:
         reports it, as ``RolloutSampler`` does for ``rollout/*``.
         """
         groups: list[TrajectoryGroup] = []
-        for ds, ds_cfg in zip(self.datasources, self.config.data_sources, strict=True):
-            groups += ds.get(int(ds_cfg.num_prompts_per_step), step)
-
         trajectories: list[Trajectory] = []
         num_truncated = 0
-        for group in groups:
-            for traj in group.trajectories:
-                num_truncated += self._tokenize_trajectory(traj)
-                trajectories.append(traj)
+        for ds, ds_cfg in zip(self.datasources, self.config.data_sources, strict=True):
+            ds_groups = ds.get(int(ds_cfg.num_prompts_per_step), step)
+            max_seq_len = ds_cfg.get("max_seq_len")
+            for group in ds_groups:
+                for traj in group.trajectories:
+                    num_truncated += self._tokenize_trajectory(traj, max_seq_len)
+                    trajectories.append(traj)
+            groups += ds_groups
 
         self.metrics = {step: _summary_metrics(trajectories, num_truncated)}
         if self.metrics[step]:
@@ -162,7 +177,7 @@ class SFTSampler:
             track(self.metrics[step], step)
         return groups
 
-    def _tokenize_trajectory(self, traj: Trajectory) -> bool:
+    def _tokenize_trajectory(self, traj: Trajectory, max_seq_len: int | None) -> bool:
         """Turn one dataset conversation into a trainable Trajectory, in place.
 
         Renders ``traj.prompt`` with the chat template, builds the assistant-turn
@@ -171,7 +186,7 @@ class SFTSampler:
         ``token_rewards`` placeholders and a single trainable ``Segment``.
 
         Returns:
-            Whether the conversation was cut to ``sft.max_seq_len``.
+            Whether the conversation was cut to its data source's ``max_seq_len``.
 
         Raises:
             ValueError: If ``traj.prompt`` is not a message list, or it renders
@@ -182,15 +197,15 @@ class SFTSampler:
                 f"SFT trajectory {traj.trajectory_id} needs a message list in dataset.input_key, "
                 f"got {type(traj.prompt).__name__}"
             )
-        tokens, mask = self.mask_generator.generate(traj.prompt, tools=traj.metadata.get("tools"))
-        truncated = bool(self.max_seq_len and len(tokens) > self.max_seq_len)
+        tokens, mask = self.sft_tokenizer.tokenize(traj.prompt, tools=traj.metadata.get("tools"))
+        truncated = bool(max_seq_len and len(tokens) > max_seq_len)
         if truncated:
-            tokens, mask = tokens[: self.max_seq_len], mask[: self.max_seq_len]
+            tokens, mask = tokens[:max_seq_len], mask[:max_seq_len]
         if len(tokens) < 2:
             raise ValueError(f"SFT trajectory {traj.trajectory_id} renders to fewer than 2 tokens")
 
         # The first token has no preceding logit, so at least one token is prompt.
-        resp_len = min(get_response_length(mask), len(tokens) - 1)
+        resp_len = min(trainable_suffix_length(mask), len(tokens) - 1)
         if resp_len == 0:
             # Nothing to learn (fully masked or truncated away): keep the sample
             # so DP/mini-batch counts stay fixed, but give it zero loss weight.
@@ -218,7 +233,7 @@ class SFTSampler:
                 len(tokens),
                 resp_len,
                 sum(loss_masks),
-                decode_masked_spans(self.tokenizer, tokens[-resp_len:], loss_masks),
+                decode_trainable_spans(self.tokenizer, tokens[-resp_len:], loss_masks),
             )
 
         return truncated

@@ -1,16 +1,16 @@
-"""Unit tests for coda.agentflow.loss_mask.
+"""Unit tests for coda.agentflow.sft_tokenizer.
 
-Run: python -m pytest tests/ut/agentflow/test_loss_mask.py -v
+Run: python -m pytest tests/ut/agentflow/test_sft_tokenizer.py -v
 """
 
 import os
 
 import pytest
 
-from coda.agentflow.loss_mask import (
-    LossMaskGenerator,
-    decode_masked_spans,
-    get_response_length,
+from coda.agentflow.sft_tokenizer import (
+    SFTTokenizer,
+    decode_trainable_spans,
+    trainable_suffix_length,
 )
 from tests.ut.agentflow.fake_tokenizers import (
     FakeDeepSeekV4Tokenizer,
@@ -25,10 +25,10 @@ EOS = "<｜end▁of▁sentence｜>"
 
 
 def _spans(tokenizer, messages, tools=None, **template_kwargs):
-    gen = LossMaskGenerator(tokenizer, template_kwargs)
-    ids, mask = gen.generate(messages, tools=tools)
+    sft_tok = SFTTokenizer(tokenizer, template_kwargs)
+    ids, mask = sft_tok.tokenize(messages, tools=tools)
     assert len(ids) == len(mask)
-    return decode_masked_spans(tokenizer, ids, mask)
+    return decode_trainable_spans(tokenizer, ids, mask)
 
 
 # ---------------------------------------------------------------------------
@@ -36,18 +36,18 @@ def _spans(tokenizer, messages, tools=None, **template_kwargs):
 # ---------------------------------------------------------------------------
 
 def test_qwen_skip_prefix_probed_from_generation_prompt():
-    gen = LossMaskGenerator(FakeQwenTokenizer())
-    assert gen.skip_prefixes == ["<think>\n"]
+    sft_tok = SFTTokenizer(FakeQwenTokenizer())
+    assert sft_tok.skip_prefixes == ["<think>\n"]
 
 
 def test_qwen_no_prefill_probes_no_skip_prefix():
-    gen = LossMaskGenerator(FakeQwenNoPrefillTokenizer())
-    assert gen.skip_prefixes == []
+    sft_tok = SFTTokenizer(FakeQwenNoPrefillTokenizer())
+    assert sft_tok.skip_prefixes == []
 
 
 def test_qwen_thinking_off_probes_empty_think_block():
-    gen = LossMaskGenerator(FakeQwenThinkingOffTokenizer())
-    assert gen.skip_prefixes == ["<think>\n\n</think>\n\n"]
+    sft_tok = SFTTokenizer(FakeQwenThinkingOffTokenizer())
+    assert sft_tok.skip_prefixes == ["<think>\n\n</think>\n\n"]
 
 
 # ---------------------------------------------------------------------------
@@ -247,24 +247,24 @@ def test_real_tokenizer_trains_end_marker_but_not_prefill():
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         os.environ["CODA_SFT_REAL_TOKENIZER"], trust_remote_code=True
     )
-    gen = LossMaskGenerator(tokenizer)
+    sft_tok = SFTTokenizer(tokenizer)
     messages = [
         {"role": "user", "content": "What is 2+2?"},
         {"role": "assistant", "content": "4"},
         {"role": "user", "content": "And 3+3?"},
         {"role": "assistant", "content": "6"},
     ]
-    ids, mask = gen.generate(messages)
-    spans = decode_masked_spans(tokenizer, ids, mask)
+    ids, mask = sft_tok.tokenize(messages)
+    spans = decode_trainable_spans(tokenizer, ids, mask)
 
     # One span per assistant turn, each ending with the end marker so the model
     # learns to stop; neither the header nor a pre-filled prefix is trained.
     assert len(spans) == 2
     for span, answer in zip(spans, ("4", "6")):
-        assert span.endswith(gen.end_marker)
+        assert span.endswith(sft_tok.end_marker)
         assert answer in span
-        assert gen.assistant_header not in span
-        assert not any(span.startswith(prefix) for prefix in gen.skip_prefixes)
+        assert sft_tok.assistant_header not in span
+        assert not any(span.startswith(prefix) for prefix in sft_tok.skip_prefixes)
 
 
 # ---------------------------------------------------------------------------
@@ -275,5 +275,5 @@ def test_real_tokenizer_trains_end_marker_but_not_prefill():
     "mask, expected",
     [([0, 0, 1, 0, 1], 3), ([1, 1], 2), ([0, 0], 0), ([], 0)],
 )
-def test_get_response_length(mask, expected):
-    assert get_response_length(mask) == expected
+def test_trainable_suffix_length(mask, expected):
+    assert trainable_suffix_length(mask) == expected

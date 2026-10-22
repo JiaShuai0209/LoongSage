@@ -1,11 +1,11 @@
-"""Multi-turn SFT loss masks derived from the rendered chat template.
+"""SFT tokenization: token ids plus assistant-turn loss masks from the rendered chat template.
 
 The whole conversation is rendered once with the tokenizer's chat template and
 re-tokenized with ``return_offsets_mapping``.  Each assistant turn is located in
 the rendered text by its ``assistant_header`` and closed by its ``end_marker``;
 the characters in between (minus a leading generation-prompt prefix such as
 ``<think>\\n``) are marked trainable and projected onto tokens via the offset
-mapping.  This mirrors slime's ``gen_multi_turn_loss_mask_qwen3_5``.
+mapping.
 
 The three markers are not configured per model: at construction a sentinel
 conversation is rendered with the active chat template and the text the template
@@ -33,7 +33,7 @@ _PROBE = [
 _U1, _A1, _U2, _A2 = (message["content"] for message in _PROBE)
 
 
-class LossMaskGenerator:
+class SFTTokenizer:
     """Tokenize a conversation and mark the assistant tokens to train on."""
 
     def __init__(self, tokenizer: Any, generation_prompt_kwargs: Mapping[str, Any] | None = None):
@@ -48,9 +48,16 @@ class LossMaskGenerator:
         )
 
     def _probe_markers(self) -> tuple[str, str, list[str]]:
-        """Header / skip prefixes: common prefix of a history turn's opening and the
-        generation prompt, and what each adds beyond it (pre-filled at inference).
-        End marker: common prefix of the history and final turn's closing."""
+        """Derive ``(assistant_header, end_marker, skip_prefixes)`` from the sentinel renders.
+
+        - Header: common prefix of a history turn's opening and the generation prompt,
+          minus the user turn's own closing (only if that closing is a strict prefix).
+        - Skip prefixes: what either opening adds beyond their common prefix (pre-filled
+          at inference), longest first so that when one starts with another, ``tokenize``
+          skips the longer one.
+        - End marker: common prefix of the history and final turn's closing, right-stripped
+          because what follows it (newline, next turn) differs between the two.
+        """
         full = self._render(_PROBE, None, add_generation_prompt=False)
         gen = self._render(_PROBE[:1], None, add_generation_prompt=True)
         # Raw probe renders, kept for logging what the markers were parsed from.
@@ -81,7 +88,7 @@ class LossMaskGenerator:
         Only the final turn's suffix is pinned: it may open with model output the
         template renders for an empty reasoning block (DeepSeek's ``</think>``).
         """
-        spans = decode_masked_spans(self.tokenizer, *self.generate(_PROBE))
+        spans = decode_trainable_spans(self.tokenizer, *self.tokenize(_PROBE))
         history, final = _A1 + self.end_marker, _A2 + self.end_marker
         if (
             len(spans) != 2
@@ -90,13 +97,13 @@ class LossMaskGenerator:
             or any(user in span for span in spans for user in (_U1, _U2))
         ):
             raise ValueError(
-                f"loss-mask probe self-check failed: trained spans {spans!r}, expected "
+                f"chat-template probe self-check failed: trained spans {spans!r}, expected "
                 f"[{history!r}, ...{final!r}] (assistant_header={self.assistant_header!r}, "
                 f"end_marker={self.end_marker!r}, skip_prefixes={self.skip_prefixes!r}); "
                 "chat template unsupported"
             )
 
-    def generate(
+    def tokenize(
         self,
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
@@ -170,7 +177,7 @@ class LossMaskGenerator:
         return token_ids, loss_mask
 
 
-def get_response_length(loss_mask: list[int]) -> int:
+def trainable_suffix_length(loss_mask: list[int]) -> int:
     """Length of the suffix that starts at the first trainable token (0 if none)."""
     for index, value in enumerate(loss_mask):
         if value:
@@ -178,7 +185,7 @@ def get_response_length(loss_mask: list[int]) -> int:
     return 0
 
 
-def decode_masked_spans(tokenizer: Any, token_ids: list[int], loss_mask: list[int]) -> list[str]:
+def decode_trainable_spans(tokenizer: Any, token_ids: list[int], loss_mask: list[int]) -> list[str]:
     """Decode each contiguous trainable run, to eyeball what the model learns."""
     spans: list[str] = []
     run: list[int] = []

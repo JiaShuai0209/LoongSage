@@ -22,7 +22,7 @@ from coda.data_factory.data_processor import (
 from coda.controller.train_manager import TrainManager
 from coda.controller.rollout_manager import RolloutManager
 from coda.controller.teacher_manager import TeacherManager
-from coda.controller.sft_sampler import SFTSampler, validate_sft_config
+from coda.controller.sft_sampler import SFTSampler, prepare_sft_config
 from coda.transfer_mesh import ChannelMeta
 from coda.utils.checkpoint_utils import get_tracker_file, resolve_dist_ckpt_dir
 from coda.utils.tracking import configure_tracking, time_marker, TimeMarkerAcc, track
@@ -138,7 +138,7 @@ class Trainer:
 
     def _validate_config(self) -> None:
         if Mode(self.config.run_mode) == Mode.SFT:
-            validate_sft_config(self.config)
+            prepare_sft_config(self.config)
 
         if self.config.fully_async.enable:
             if self.config.colocate:
