@@ -42,6 +42,8 @@ def _ds_bucket() -> dict:
         "group_total": 0,
         "group_all_correct": 0,
         "group_all_wrong": 0,
+        # Custom "metric/<spec>" trajectory metadata: spec -> per-trajectory values.
+        "extra": {},
     }
 
 
@@ -89,6 +91,9 @@ def _accumulate_ds_metrics(bucket: dict, traj_group: TrajectoryGroup, data_sourc
         compaction_events = (num_compact_segments + 1) // 2
         bucket["compactions_per_trajectory"].append(compaction_events)
 
+        for spec, value in eval_utils.metadata_metrics(t.metadata).items():
+            bucket["extra"].setdefault(spec, []).append(value)
+
 
 def _summary_metrics(bucket: dict, key_prefix: str) -> dict[str, float]:
     """Summarize one bucket into ``{key_prefix}<metric>`` reward / turn / response stats.
@@ -119,6 +124,8 @@ def _summary_metrics(bucket: dict, key_prefix: str) -> dict[str, float]:
             sum(1 for v in bucket["compactions_per_trajectory"] if v > 0) / n
         )
         summary[f"{key_prefix}compaction_count"] = sum(bucket["compactions_per_trajectory"])
+        for name, value in eval_utils.reduce_metadata_metrics(bucket["extra"]).items():
+            summary[f"{key_prefix}{name}"] = value
 
     group_total = bucket["group_total"]
     if group_total > 0:
