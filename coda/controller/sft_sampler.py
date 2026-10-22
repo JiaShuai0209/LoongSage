@@ -22,7 +22,7 @@ from coda.utils.tracking import track
 
 logger = logging.getLogger(__name__)
 
-# Values run_mode=sft implies; prepare_sft_config writes them into the config.
+# Values run_mode=sft implies; apply_sft_forced_settings writes them into the config.
 SFT_FORCED_SETTINGS = {
     # No rollout engine shares the GPUs, so colocate offload/onload is pure overhead.
     "colocate": False,
@@ -57,7 +57,7 @@ def _summary_metrics(trajectories: list[Trajectory], num_truncated: int) -> dict
         metrics[f"sft/{name}_mean"] = sum(values) / n
         metrics[f"sft/{name}_max"] = max(values)
         metrics[f"sft/{name}_min"] = min(values)
-    # Cut by data_source.max_seq_len over the whole sequence, unlike rollout's
+    # Cut by data_source.sft_max_seq_len over the whole sequence, unlike rollout's
     # response_length_clip_ratio (max_response_len_per_trajectory on the response).
     metrics["sft/seq_length_clip_ratio"] = num_truncated / n
     metrics["sft/trained_tokens"] = sum(trained)
@@ -66,12 +66,8 @@ def _summary_metrics(trajectories: list[Trajectory], num_truncated: int) -> dict
     return metrics
 
 
-def prepare_sft_config(config: DictConfig) -> None:
-    """Apply ``SFT_FORCED_SETTINGS`` in place, then reject settings SFT cannot honour.
-
-    Raises:
-        ValueError: On the first incompatible setting.
-    """
+def apply_sft_forced_settings(config: DictConfig) -> None:
+    """Write ``SFT_FORCED_SETTINGS`` into ``config`` in place and log what changed."""
     applied = []
     for key, value in SFT_FORCED_SETTINGS.items():
         previous = OmegaConf.select(config, key)
@@ -79,10 +75,13 @@ def prepare_sft_config(config: DictConfig) -> None:
         applied.append(f"{key}={value}" + ("" if previous == value else f" (was {previous})"))
     logger.info("[sft] run_mode=sft sets: %s", ", ".join(applied))
 
-    # Silently ignored otherwise (the config is not struct), which would disable truncation.
-    if OmegaConf.select(config, "sft.max_seq_len") is not None:
-        raise ValueError("sft.max_seq_len has moved to data_source.max_seq_len (per data source)")
 
+def validate_sft_config(config: DictConfig) -> None:
+    """Reject settings SFT cannot honour.
+
+    Raises:
+        ValueError: On the first incompatible setting.
+    """
     algorithm = config.algorithm
     if algorithm.policy_loss != "sft" or algorithm.advantage_estimator != "sft":
         raise ValueError(
@@ -149,8 +148,8 @@ class SFTSampler:
             self.sft_tokenizer.skip_prefixes,
         )
         logger.info(
-            "[sft] max_seq_len per data source: %s",
-            [ds_cfg.get("max_seq_len") for ds_cfg in config.data_sources],
+            "[sft] sft_max_seq_len per data source: %s",
+            [ds_cfg.sft_max_seq_len for ds_cfg in config.data_sources],
         )
 
     def __call__(self, step: int) -> list[TrajectoryGroup]:
@@ -164,7 +163,7 @@ class SFTSampler:
         num_truncated = 0
         for ds, ds_cfg in zip(self.datasources, self.config.data_sources, strict=True):
             ds_groups = ds.get(int(ds_cfg.num_prompts_per_step), step)
-            max_seq_len = ds_cfg.get("max_seq_len")
+            max_seq_len = ds_cfg.sft_max_seq_len
             for group in ds_groups:
                 for traj in group.trajectories:
                     num_truncated += self._tokenize_trajectory(traj, max_seq_len)
@@ -186,7 +185,7 @@ class SFTSampler:
         ``token_rewards`` placeholders and a single trainable ``Segment``.
 
         Returns:
-            Whether the conversation was cut to its data source's ``max_seq_len``.
+            Whether the conversation was cut to its data source's ``sft_max_seq_len``.
 
         Raises:
             ValueError: If ``traj.prompt`` is not a message list, or it renders

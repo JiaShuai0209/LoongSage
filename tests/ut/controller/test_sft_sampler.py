@@ -11,7 +11,7 @@ from omegaconf import OmegaConf
 
 from coda.agentflow.sft_tokenizer import decode_trainable_spans
 from coda.agentflow.trajectory_store import Trajectory, TrajectoryGroup, TrajectoryStatus
-from coda.controller.sft_sampler import SFTSampler, prepare_sft_config
+from coda.controller.sft_sampler import SFTSampler, apply_sft_forced_settings, validate_sft_config
 from tests.ut.agentflow.fake_tokenizers import FakeDeepSeekV4Tokenizer, FakeQwenTokenizer
 
 DEFAULT_YAML = Path(__file__).resolve().parents[3] / "conf" / "default.yaml"
@@ -26,6 +26,9 @@ SFT_OVERRIDES = {
 def make_sft_config(**overrides):
     cfg = OmegaConf.merge(OmegaConf.load(DEFAULT_YAML), SFT_OVERRIDES, overrides)
     OmegaConf.resolve(cfg)
+    # As trainer.normalize_data_sources does (not imported: trainer pulls in Megatron):
+    # every data_sources entry inherits the data_source defaults.
+    cfg.data_sources = [OmegaConf.merge(cfg.data_source, ds) for ds in cfg.data_sources]
     return cfg
 
 
@@ -51,7 +54,7 @@ def tracked(monkeypatch):
 
 def make_sampler(groups=(), max_seq_len=None):
     return SFTSampler(
-        make_sft_config(data_source={"max_seq_len": max_seq_len}),
+        make_sft_config(data_source={"sft_max_seq_len": max_seq_len}),
         [FakeDataSource(list(groups))],
         tokenizer=FakeQwenTokenizer(),
     )
@@ -459,14 +462,14 @@ def test_call_concatenates_datasources_in_config_order():
     ]
 
 
-def test_max_seq_len_applies_per_data_source():
+def test_sft_max_seq_len_applies_per_data_source():
     """Each data source cuts its own conversations; the clip ratio counts both."""
     full = len(FakeQwenTokenizer().apply_chat_template(MESSAGES))
     ds_a = FakeDataSource([make_group(MESSAGES, prompt_id="a0")])
     ds_b = FakeDataSource([make_group(MESSAGES, prompt_id="b0", ds_index=1)])
     config = make_sft_config(data_sources=[
-        {"num_prompts_per_step": 1, "num_trajectories_per_prompt": 1, "max_seq_len": full - 1},
-        {"num_prompts_per_step": 1, "num_trajectories_per_prompt": 1, "max_seq_len": None},
+        {"num_prompts_per_step": 1, "num_trajectories_per_prompt": 1, "sft_max_seq_len": full - 1},
+        {"num_prompts_per_step": 1, "num_trajectories_per_prompt": 1, "sft_max_seq_len": None},
     ])
     sampler = SFTSampler(config, [ds_a, ds_b], tokenizer=FakeQwenTokenizer())
 
@@ -553,15 +556,15 @@ def test_mixed_batch_flattens_to_one_training_row_per_conversation(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# prepare_sft_config
+# apply_sft_forced_settings / validate_sft_config
 # ---------------------------------------------------------------------------
 
 def test_valid_sft_config_passes():
-    prepare_sft_config(make_sft_config())
+    validate_sft_config(make_sft_config())
 
 
 def test_eval_interval_zero_is_allowed():
-    prepare_sft_config(make_sft_config(rollout={"eval": {"interval": 0}}))
+    validate_sft_config(make_sft_config(rollout={"eval": {"interval": 0}}))
 
 
 def test_second_datasource_with_multiple_trajectories_raises():
@@ -570,7 +573,7 @@ def test_second_datasource_with_multiple_trajectories_raises():
         {"num_prompts_per_step": 1, "num_trajectories_per_prompt": 4},
     ])
     with pytest.raises(ValueError, match=r"data_sources\[1\]\.num_trajectories_per_prompt=1"):
-        prepare_sft_config(config)
+        validate_sft_config(config)
 
 
 @pytest.mark.parametrize(
@@ -585,16 +588,10 @@ def test_second_datasource_with_multiple_trajectories_raises():
 def test_sft_forced_settings_are_set_and_logged(overrides, logged, caplog):
     config = make_sft_config(**overrides)
     with caplog.at_level(logging.INFO, logger="coda.controller.sft_sampler"):
-        prepare_sft_config(config)
+        apply_sft_forced_settings(config)
     assert config.colocate is False
     assert config.trainer.use_rollout_log_probs is True
     assert any(r.getMessage() == f"[sft] run_mode=sft sets: {logged}" for r in caplog.records)
-
-
-def test_legacy_sft_max_seq_len_is_rejected():
-    """Ignoring the old key would silently disable truncation."""
-    with pytest.raises(ValueError, match="data_source.max_seq_len"):
-        prepare_sft_config(make_sft_config(sft={"max_seq_len": 1024}))
 
 
 @pytest.mark.parametrize(
@@ -615,4 +612,4 @@ def test_legacy_sft_max_seq_len_is_rejected():
 )
 def test_invalid_sft_config_raises(overrides, match):
     with pytest.raises(ValueError, match=match):
-        prepare_sft_config(make_sft_config(**overrides))
+        validate_sft_config(make_sft_config(**overrides))

@@ -291,7 +291,7 @@ class TestTrainerValidateConfig:
             trainer._validate_config()
 
     def test_sft_mode_runs_sft_checks(self):
-        """run_mode=sft routes through prepare_sft_config (rules tested in test_sft_sampler)."""
+        """run_mode=sft routes through validate_sft_config (rules tested in test_sft_sampler)."""
         config = make_minimal_config(
             run_mode="sft",
             algorithm={"policy_loss": "grpo", "advantage_estimator": "grpo"},

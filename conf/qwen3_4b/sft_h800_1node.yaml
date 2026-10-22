@@ -24,7 +24,7 @@ data_source:
     label_key: null
   num_prompts_per_step: 64       # global batch size (conversations per optimizer step)
   num_trajectories_per_prompt: 1
-  max_seq_len: 16384             # truncate each rendered conversation to this many tokens
+  sft_max_seq_len: 16384         # truncate each rendered conversation to this many tokens
 
 trainer:
   mini_batch_size: 64            # == num_prompts_per_step: one optimizer step per training step
