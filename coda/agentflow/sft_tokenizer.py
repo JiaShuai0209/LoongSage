@@ -16,11 +16,14 @@ conversation.
 
 from __future__ import annotations
 
+import logging
 import os
 from collections.abc import Mapping
 from typing import Any
 
 from coda.agentflow.tokenizer_manager import _ensure_token_list
+
+logger = logging.getLogger(__name__)
 
 # One history and one final assistant turn.  Plain ASCII letters: no template
 # strips, splits or escapes them.
@@ -60,8 +63,8 @@ class SFTTokenizer:
         """
         full = self._render(_PROBE, None, add_generation_prompt=False)
         gen = self._render(_PROBE[:1], None, add_generation_prompt=True)
-        # Raw probe renders, kept for logging what the markers were parsed from.
-        self.probe_full, self.probe_gen = full, gen
+        # Logged before the self-check, so a template it rejects still shows what was parsed.
+        logger.info("[sft] chat template probe renders: full=%r gen=%r", full, gen)
         open_hist = full.partition(_U1)[2].partition(_A1)[0]
         open_gen = gen.partition(_U1)[2]
         opening = os.path.commonprefix([open_hist, open_gen])
@@ -80,6 +83,12 @@ class SFTTokenizer:
 
         close_hist = full.partition(_A1)[2].partition(_U2)[0]
         end_marker = os.path.commonprefix([close_hist, full.partition(_A2)[2]]).rstrip()
+        logger.info(
+            "[sft] markers probed from chat template: header=%r end=%r skip_prefixes=%r",
+            header,
+            end_marker,
+            skip_prefixes,
+        )
         return header, end_marker, skip_prefixes
 
     def _self_check(self) -> None:
@@ -109,9 +118,6 @@ class SFTTokenizer:
         tools: list[dict[str, Any]] | None = None,
     ) -> tuple[list[int], list[int]]:
         """Return ``(token_ids, loss_mask)`` over the full rendered conversation.
-
-        Assistant messages with ``step_loss_mask: 0`` are kept as context but not
-        trained on.
 
         Raises:
             ValueError: If the tokenizer gives no offsets, the re-tokenized text
@@ -157,10 +163,6 @@ class SFTTokenizer:
             end = end_pos + len(self.end_marker)
             cursor = end
 
-            # ``== 0`` rather than ``!= 1``: parquet fills the field with None
-            # on rows that omit it, which must still be trained.
-            if message.get("step_loss_mask") == 0:
-                continue
             for prefix in self.skip_prefixes:
                 if rendered.startswith(prefix, start):
                     start += len(prefix)
@@ -175,14 +177,6 @@ class SFTTokenizer:
             for start, end in offsets
         ]
         return token_ids, loss_mask
-
-
-def trainable_suffix_length(loss_mask: list[int]) -> int:
-    """Length of the suffix that starts at the first trainable token (0 if none)."""
-    for index, value in enumerate(loss_mask):
-        if value:
-            return len(loss_mask) - index
-    return 0
 
 
 def decode_trainable_spans(tokenizer: Any, token_ids: list[int], loss_mask: list[int]) -> list[str]:
