@@ -7,11 +7,7 @@ import os
 
 import pytest
 
-from coda.agentflow.sft_tokenizer import (
-    SFTTokenizer,
-    decode_trainable_spans,
-    trainable_suffix_length,
-)
+from coda.agentflow.sft_tokenizer import SFTTokenizer, decode_trainable_spans
 from tests.ut.agentflow.fake_tokenizers import (
     FakeDeepSeekV4Tokenizer,
     FakeMergingTokenizer,
@@ -85,25 +81,6 @@ def test_tool_turns_are_context_only():
         "\n<tool_call>get_weather</tool_call>" + IM_END,
         "It is sunny." + IM_END,
     ]
-
-
-def test_step_loss_mask_zero_keeps_turn_as_context():
-    messages = [
-        {"role": "user", "content": "q1"},
-        {"role": "assistant", "content": "bad", "step_loss_mask": 0},
-        {"role": "user", "content": "q2"},
-        {"role": "assistant", "content": "good"},
-    ]
-    assert _spans(FakeQwenTokenizer(), messages) == ["good" + IM_END]
-
-
-def test_step_loss_mask_none_is_trained():
-    """Parquet fills a missing step_loss_mask with None; that turn is still trained."""
-    messages = [
-        {"role": "user", "content": "q"},
-        {"role": "assistant", "content": "a", "step_loss_mask": None},
-    ]
-    assert _spans(FakeQwenTokenizer(), messages) == ["a" + IM_END]
 
 
 def test_think_prefix_is_not_trained_but_reasoning_is():
@@ -265,15 +242,3 @@ def test_real_tokenizer_trains_end_marker_but_not_prefill():
         assert answer in span
         assert sft_tok.assistant_header not in span
         assert not any(span.startswith(prefix) for prefix in sft_tok.skip_prefixes)
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-@pytest.mark.parametrize(
-    "mask, expected",
-    [([0, 0, 1, 0, 1], 3), ([1, 1], 2), ([0, 0], 0), ([], 0)],
-)
-def test_trainable_suffix_length(mask, expected):
-    assert trainable_suffix_length(mask) == expected

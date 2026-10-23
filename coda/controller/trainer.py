@@ -22,7 +22,7 @@ from coda.data_factory.data_processor import (
 from coda.controller.train_manager import TrainManager
 from coda.controller.rollout_manager import RolloutManager
 from coda.controller.teacher_manager import TeacherManager
-from coda.controller.sft_sampler import SFTSampler, apply_sft_forced_settings, validate_sft_config
+from coda.controller.sft_sampler import SFTSampler, validate_sft_config
 from coda.transfer_mesh import ChannelMeta
 from coda.utils.checkpoint_utils import get_tracker_file, resolve_dist_ckpt_dir
 from coda.utils.tracking import configure_tracking, time_marker, TimeMarkerAcc, track
@@ -81,9 +81,6 @@ class Trainer:
             )
         self.dp_size = train_world_size // num_gpu_per_dp
         self.is_sft = Mode(self.config.run_mode) == Mode.SFT
-        if self.is_sft:
-            # Before validation and before anything reads colocate / use_rollout_log_probs.
-            apply_sft_forced_settings(self.config)
         self._validate_config()
         self.is_colocated = self.config.colocate
         self.is_fully_async = self.config.fully_async.enable

@@ -11,7 +11,7 @@ Run: python -m pytest tests/ut/agentflow/test_sft_tokenizer_probe.py -v
 
 import pytest
 
-from coda.agentflow.sft_tokenizer import SFTTokenizer, decode_trainable_spans
+from coda.agentflow.sft_tokenizer import _PROBE, SFTTokenizer, decode_trainable_spans
 from tests.ut.agentflow.fake_tokenizers import (
     DS_BOS,
     DS_EFFORT,
@@ -75,18 +75,28 @@ PROBE_CASES = [
 
 def _describe(sft_tok: SFTTokenizer) -> str:
     """Probe renders and parsed markers, printed on assertion failure."""
+    full, gen = _probe_renders(sft_tok.tokenizer, sft_tok.template_kwargs)
     return (
-        f"\nfull={sft_tok.probe_full!r}\ngen={sft_tok.probe_gen!r}\nheader={sft_tok.assistant_header!r} "
+        f"\nfull={full!r}\ngen={gen!r}\nheader={sft_tok.assistant_header!r} "
         f"end={sft_tok.end_marker!r} skip_prefixes={sft_tok.skip_prefixes!r}"
     )
 
 
+def _probe_renders(tokenizer, kwargs) -> tuple[str, str]:
+    """The sentinel renders ``SFTTokenizer`` parses: ``(full, gen)``."""
+    full = tokenizer.apply_chat_template(_PROBE, tokenize=False, add_generation_prompt=False, **kwargs)
+    gen = tokenizer.apply_chat_template(_PROBE[:1], tokenize=False, add_generation_prompt=True, **kwargs)
+    return full, gen
+
+
 @pytest.mark.parametrize("factory, kwargs, full, gen_prompt, header, end, skips", PROBE_CASES)
 def test_probe_renders_and_parsed_markers(factory, kwargs, full, gen_prompt, header, end, skips):
-    sft_tok = SFTTokenizer(factory(), kwargs)
+    tokenizer = factory()
+    probe_full, probe_gen = _probe_renders(tokenizer, kwargs)
+    assert probe_full == full
+    assert probe_gen == gen_prompt
+    sft_tok = SFTTokenizer(tokenizer, kwargs)
     info = _describe(sft_tok)
-    assert sft_tok.probe_full == full, info
-    assert sft_tok.probe_gen == gen_prompt, info
     assert sft_tok.assistant_header == header, info
     assert sft_tok.end_marker == end, info
     assert sft_tok.skip_prefixes == skips, info

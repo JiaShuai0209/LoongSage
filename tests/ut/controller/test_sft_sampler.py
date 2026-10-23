@@ -11,7 +11,7 @@ from omegaconf import OmegaConf
 
 from coda.agentflow.sft_tokenizer import decode_trainable_spans
 from coda.agentflow.trajectory_store import Trajectory, TrajectoryGroup, TrajectoryStatus
-from coda.controller.sft_sampler import SFTSampler, apply_sft_forced_settings, validate_sft_config
+from coda.controller.sft_sampler import SFTSampler, validate_sft_config
 from tests.ut.agentflow.fake_tokenizers import FakeDeepSeekV4Tokenizer, FakeQwenTokenizer
 
 DEFAULT_YAML = Path(__file__).resolve().parents[3] / "conf" / "default.yaml"
@@ -107,8 +107,8 @@ MESSAGES = [
 
 TOOLS = [{"type": "function", "function": {"name": "read"}}]
 
-# A coding-agent episode: reasoning + tool calls, tool outputs in between, one
-# failed attempt excluded via ``step_loss_mask: 0`` and a plain final answer.
+# A coding-agent episode: reasoning + tool calls, tool outputs in between and a
+# plain final answer.
 AGENTIC = [
     {"role": "system", "content": "sys"},
     {"role": "user", "content": "fix bug"},
@@ -119,13 +119,6 @@ AGENTIC = [
         "tool_calls": [{"function": {"name": "read"}}],
     },
     {"role": "tool", "content": "TOOL_OUT_1"},
-    {
-        "role": "assistant",
-        "content": "retry",
-        "tool_calls": [{"function": {"name": "edit"}}],
-        "step_loss_mask": 0,
-    },
-    {"role": "tool", "content": "TOOL_OUT_2"},
     {"role": "assistant", "content": "done", "tool_calls": [{"function": {"name": "test"}}]},
     {"role": "tool", "content": "TOOL_OUT_3"},
     {"role": "assistant", "content": "fixed"},
@@ -138,10 +131,7 @@ AGENTIC_SPANS = [
     "fixed" + IM_END,
 ]
 
-ALL_MASKED = [
-    {"role": "user", "content": "q"},
-    {"role": "assistant", "content": "a", "step_loss_mask": 0},
-]
+NO_ASSISTANT = [{"role": "user", "content": "only a question"}]
 
 
 # ---------------------------------------------------------------------------
@@ -221,7 +211,7 @@ def test_fewer_than_two_tokens_raises(messages, sft_cfg):
 
 def test_conversation_without_assistant_falls_back_to_zero_weight_row():
     """Pins current behaviour: nothing to train is silent, not an error."""
-    _, traj = sample_one(make_group([{"role": "user", "content": "only a question"}]))
+    _, traj = sample_one(make_group(NO_ASSISTANT))
     assert traj.loss_masks == [0]
 
 
@@ -230,12 +220,6 @@ def test_truncated_away_response_falls_back_to_zero_weight_row():
     assert len(traj.tokens) == 10
     assert traj.loss_masks == [0]
     assert traj.segments[0].logprob_end == 1
-
-
-def test_all_turns_masked_falls_back_to_zero_weight_row():
-    _, traj = sample_one(make_group(ALL_MASKED))
-    assert traj.loss_masks == [0]
-    assert len(traj.rollout_log_probs) == 1
 
 
 def test_string_prompt_is_rejected():
@@ -314,7 +298,7 @@ def test_metrics_do_not_flag_exact_length_as_truncated():
 
 
 def test_metrics_flag_zero_weight_samples():
-    sampler, _ = sample_one(make_group(ALL_MASKED))
+    sampler, _ = sample_one(make_group(NO_ASSISTANT))
 
     metrics = sampler.metrics[1]
     assert metrics["sft/trained_tokens"] == 0
@@ -335,7 +319,7 @@ def test_metrics_are_empty_without_samples(tracked):
 # Complex conversations
 # ---------------------------------------------------------------------------
 
-def test_agentic_episode_trains_only_kept_assistant_turns():
+def test_agentic_episode_trains_assistant_turns():
     tokenizer = FakeQwenTokenizer()
     sampler, traj = sample_one(make_group(AGENTIC, metadata={"tools": TOOLS}))
 
@@ -348,37 +332,10 @@ def test_agentic_episode_trains_only_kept_assistant_turns():
     # Tools block, system and user turns precede the first trained token.
     assert prompt.startswith("<|im_start|>system\n# Tools\n")
     assert prompt.endswith("fix bug" + IM_END + "\n<|im_start|>assistant\n<think>\n")
-    # Tool outputs and the excluded attempt sit inside the response slice as context.
-    for context in ("TOOL_OUT_1", "retry", "<tool_call>edit</tool_call>", "TOOL_OUT_2", "TOOL_OUT_3"):
+    # Tool outputs sit inside the response slice as context.
+    for context in ("TOOL_OUT_1", "TOOL_OUT_3"):
         assert context in response
         assert all(context not in span for span in trained_spans(traj))
-
-
-def test_masked_leading_turn_moves_response_start():
-    """A masked first assistant turn becomes prompt; the response starts at the next kept turn."""
-    messages = [
-        {"role": "user", "content": "q1"},
-        {"role": "assistant", "content": "bad", "step_loss_mask": 0},
-        {"role": "user", "content": "q2"},
-        {"role": "assistant", "content": "good"},
-    ]
-    _, traj = sample_one(make_group(messages))
-
-    resp_len = traj.segments[0].logprob_end
-    assert "bad" in decode(traj.tokens[:-resp_len])
-    assert decode(traj.tokens[-resp_len:]) == "good" + IM_END + "\n"
-    assert traj.loss_masks == [1] * len("good" + IM_END) + [0]
-
-
-def test_masked_trailing_turn_stays_in_response_with_zero_mask():
-    messages = MESSAGES[:3] + [{"role": "assistant", "content": "a2", "step_loss_mask": 0}]
-    _, traj = sample_one(make_group(messages))
-
-    tokens, mask = response_slice(traj)
-    assert decode(tokens).startswith("a1" + IM_END)
-    assert decode(tokens).endswith("a2" + IM_END + "\n")
-    assert trained_spans(traj) == ["a1" + IM_END]
-    assert sum(mask) == len("a1" + IM_END)
 
 
 # "<|im_start|>user\nq<|im_end|>\n" + "<|im_start|>assistant\n" is 51 characters.
@@ -445,7 +402,7 @@ def test_deepseek_thinking_multi_turn_uses_generation_prompt_kwargs():
 # ---------------------------------------------------------------------------
 
 def test_call_concatenates_datasources_in_config_order():
-    ds_a = FakeDataSource([make_group(MESSAGES, prompt_id="a0"), make_group(ALL_MASKED, prompt_id="a1")])
+    ds_a = FakeDataSource([make_group(MESSAGES, prompt_id="a0"), make_group(NO_ASSISTANT, prompt_id="a1")])
     ds_b = FakeDataSource([make_group(AGENTIC, {"tools": TOOLS}, prompt_id="b0", ds_index=1)])
     config = make_sft_config(data_sources=[
         {"num_prompts_per_step": 2, "num_trajectories_per_prompt": 1},
@@ -526,13 +483,13 @@ def test_mixed_batch_flattens_to_one_training_row_per_conversation(monkeypatch):
     expected = {
         "multi": ["a1" + IM_END, "a2" + IM_END],
         "agentic": AGENTIC_SPANS,
-        "masked": [],
+        "no_assistant": [],
         "long": ["abcdefghij" + IM_END],
     }
     groups = [
         make_group(MESSAGES, prompt_id="multi", ds_index=0),
         make_group(AGENTIC, {"tools": TOOLS}, prompt_id="agentic", ds_index=0),
-        make_group(ALL_MASKED, prompt_id="masked", ds_index=1),
+        make_group(NO_ASSISTANT, prompt_id="no_assistant", ds_index=1),
         make_group(LONG_ANSWER, prompt_id="long", ds_index=1),
     ]
     sampled = make_sampler(groups)(step=1)
@@ -556,7 +513,7 @@ def test_mixed_batch_flattens_to_one_training_row_per_conversation(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# apply_sft_forced_settings / validate_sft_config
+# validate_sft_config
 # ---------------------------------------------------------------------------
 
 def test_valid_sft_config_passes():
@@ -577,21 +534,32 @@ def test_second_datasource_with_multiple_trajectories_raises():
 
 
 @pytest.mark.parametrize(
-    "overrides, logged",
+    "overrides, eval_interval",
     [
-        # default.yaml has colocate=true / use_rollout_log_probs=false
-        ({}, "colocate=False (was True), trainer.use_rollout_log_probs=True (was False)"),
-        ({"colocate": False, "trainer": {"use_rollout_log_probs": True}},
-         "colocate=False, trainer.use_rollout_log_probs=True"),
+        ({}, -1),  # default.yaml: colocate=true / use_rollout_log_probs=false / eval disabled
+        ({"colocate": False, "trainer": {"use_rollout_log_probs": True, "mini_batch_size": 16}}, -1),
+        ({"rollout": {"eval": {"interval": 10}}}, 0),
     ],
 )
-def test_sft_forced_settings_are_set_and_logged(overrides, logged, caplog):
+def test_sft_forced_settings_are_set_and_logged(overrides, eval_interval, caplog):
     config = make_sft_config(**overrides)
     with caplog.at_level(logging.INFO, logger="coda.controller.sft_sampler"):
-        apply_sft_forced_settings(config)
+        validate_sft_config(config)
     assert config.colocate is False
     assert config.trainer.use_rollout_log_probs is True
-    assert any(r.getMessage() == f"[sft] run_mode=sft sets: {logged}" for r in caplog.records)
+    assert config.trainer.mini_batch_size == 64
+    assert config.rollout.eval.interval == eval_interval
+    assert any(
+        r.getMessage() == "[sft] run_mode=sft sets colocate=False, trainer.use_rollout_log_probs=True, "
+        f"trainer.mini_batch_size=64, rollout.eval.interval={eval_interval}"
+        for r in caplog.records
+    )
+
+
+def test_sft_mini_batch_size_sums_all_data_sources():
+    config = make_sft_config(data_sources=[{"num_prompts_per_step": 48}, {"num_prompts_per_step": 16}])
+    validate_sft_config(config)
+    assert config.trainer.mini_batch_size == 64
 
 
 @pytest.mark.parametrize(
@@ -607,7 +575,6 @@ def test_sft_forced_settings_are_set_and_logged(overrides, logged, caplog):
         ({"opd": {"enable": True}}, "opd.enable"),
         ({"fully_async": {"enable": True}}, "fully_async.enable"),
         ({"data_source": {"num_trajectories_per_prompt": 2}}, "num_trajectories_per_prompt=1"),
-        ({"rollout": {"eval": {"interval": 10}}}, "rollout.eval.interval<=0"),
     ],
 )
 def test_invalid_sft_config_raises(overrides, match):

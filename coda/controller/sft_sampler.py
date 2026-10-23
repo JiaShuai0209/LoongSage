@@ -12,23 +12,15 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig
 
 from coda.agentflow.tokenizer_manager import _load_chat_template, load_tokenizer
 from coda.agentflow.trajectory_store import Segment, Trajectory, TrajectoryGroup, TrajectoryStatus
-from coda.agentflow.sft_tokenizer import SFTTokenizer, decode_trainable_spans, trainable_suffix_length
+from coda.agentflow.sft_tokenizer import SFTTokenizer, decode_trainable_spans
 from coda.data_factory.data_source import DataSource
 from coda.utils.tracking import track
 
 logger = logging.getLogger(__name__)
-
-# Values run_mode=sft implies; apply_sft_forced_settings writes them into the config.
-SFT_FORCED_SETTINGS = {
-    # No rollout engine shares the GPUs, so colocate offload/onload is pure overhead.
-    "colocate": False,
-    # The sft loss ignores old log-probs; this skips the extra old-policy forward pass.
-    "trainer.use_rollout_log_probs": True,
-}
 
 
 def _summary_metrics(trajectories: list[Trajectory], num_truncated: int) -> dict[str, float]:
@@ -66,22 +58,31 @@ def _summary_metrics(trajectories: list[Trajectory], num_truncated: int) -> dict
     return metrics
 
 
-def apply_sft_forced_settings(config: DictConfig) -> None:
-    """Write ``SFT_FORCED_SETTINGS`` into ``config`` in place and log what changed."""
-    applied = []
-    for key, value in SFT_FORCED_SETTINGS.items():
-        previous = OmegaConf.select(config, key)
-        OmegaConf.update(config, key, value)
-        applied.append(f"{key}={value}" + ("" if previous == value else f" (was {previous})"))
-    logger.info("[sft] run_mode=sft sets: %s", ", ".join(applied))
-
-
 def validate_sft_config(config: DictConfig) -> None:
-    """Reject settings SFT cannot honour.
+    """Fill the settings SFT implies, then reject settings SFT cannot honour.
+
+    Runs before anything reads these settings (``Trainer._validate_config`` calls it first).
 
     Raises:
         ValueError: On the first incompatible setting.
     """
+    # Forced parameters
+    # No rollout engine shares the GPUs, so colocate offload/onload is pure overhead.
+    config.colocate = False
+    # The sft loss ignores old log-probs; this skips the extra old-policy forward pass.
+    config.trainer.use_rollout_log_probs = True
+    # One optimizer step per training step: the mini-batch is the whole step's batch.
+    config.trainer.mini_batch_size = sum(int(ds.num_prompts_per_step) for ds in config.data_sources)
+    # SFT runs no eval generation.
+    if int(config.rollout.eval.interval) > 0:
+        config.rollout.eval.interval = 0
+    logger.info(
+        "[sft] run_mode=sft sets colocate=False, trainer.use_rollout_log_probs=True, "
+        "trainer.mini_batch_size=%d, rollout.eval.interval=%d",
+        config.trainer.mini_batch_size,
+        config.rollout.eval.interval,
+    )
+
     algorithm = config.algorithm
     if algorithm.policy_loss != "sft" or algorithm.advantage_estimator != "sft":
         raise ValueError(
@@ -106,8 +107,6 @@ def validate_sft_config(config: DictConfig) -> None:
                 f"run_mode=sft requires data_sources[{idx}].num_trajectories_per_prompt=1, "
                 f"got {ds.num_trajectories_per_prompt}"
             )
-    if int(config.rollout.eval.interval) > 0:
-        raise ValueError("run_mode=sft does not run eval generation; set rollout.eval.interval<=0")
 
 
 class SFTSampler:
@@ -136,17 +135,6 @@ class SFTSampler:
         self._logged_sample = False
         # {step: sft/* summary}; like RolloutSampler.metrics, only the current step is kept.
         self.metrics: dict[int, dict[str, float]] = {}
-        logger.info(
-            "[sft] chat template probe renders: full=%r gen=%r",
-            self.sft_tokenizer.probe_full,
-            self.sft_tokenizer.probe_gen,
-        )
-        logger.info(
-            "[sft] markers probed from chat template: header=%r end=%r skip_prefixes=%r",
-            self.sft_tokenizer.assistant_header,
-            self.sft_tokenizer.end_marker,
-            self.sft_tokenizer.skip_prefixes,
-        )
         logger.info(
             "[sft] sft_max_seq_len per data source: %s",
             [ds_cfg.sft_max_seq_len for ds_cfg in config.data_sources],
@@ -204,7 +192,8 @@ class SFTSampler:
             raise ValueError(f"SFT trajectory {traj.trajectory_id} renders to fewer than 2 tokens")
 
         # The first token has no preceding logit, so at least one token is prompt.
-        resp_len = min(trainable_suffix_length(mask), len(tokens) - 1)
+        first_trained = next((i for i, value in enumerate(mask) if value), len(tokens))
+        resp_len = len(tokens) - max(first_trained, 1)
         if resp_len == 0:
             # Nothing to learn (fully masked or truncated away): keep the sample
             # so DP/mini-batch counts stay fixed, but give it zero loss weight.

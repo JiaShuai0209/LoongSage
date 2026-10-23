@@ -231,9 +231,7 @@ class Trajectory(PydanticModel):
     # True for eval-dataset trajectories (routed out of the training batch).
     is_eval: bool = False
 
-    # Dataset row at input_key. RL: the input messages only; the response is generated.
-    # SFT (run_mode=sft): the full conversation including assistant turns, whose values
-    # may be non-str (step_loss_mask: int, content: None, tool_calls: list), hence Any.
+    # Dataset row at input_key: the prompt (RL) or the full conversation (SFT).
     prompt: str | list[dict[str, Any]] | dict[str, Any] = ""
     label: Any = None
 

@@ -1,7 +1,8 @@
 # @package _global_
 # Qwen3-4B SFT, single H800 node (8 GPUs). No inference engine is started.
 # Launch: bash examples/start.sh qwen3_4b/sft_h800_1node
-#   run_mode=sft sets colocate=false and trainer.use_rollout_log_probs=true itself.
+#   run_mode=sft sets colocate=false, trainer.use_rollout_log_probs=true and
+#   trainer.mini_batch_size=sum of num_prompts_per_step (one optimizer step per training step) itself.
 # Fill in the two ??? below, or override them on the command line:
 #   hf_model_path                         HF weight dir of Qwen3-4B
 #   data_source.dataset.prompt_data_path  .jsonl/.parquet whose "messages" column holds
@@ -27,7 +28,6 @@ data_source:
   sft_max_seq_len: 16384         # truncate each rendered conversation to this many tokens
 
 trainer:
-  mini_batch_size: 64            # == num_prompts_per_step: one optimizer step per training step
   max_tokens_per_gpu: 20480
   use_dynamic_batch_size: true
 
