@@ -99,6 +99,10 @@ def test_kill_process_tree_reaps_detached_children(tmp_path: Path) -> None:
                 break
             time.sleep(0.05)
         children = [int(pid) for pid in pid_file.read_text().split()]
+        # $! is written right after fork, before the child has run setsid(); wait for it.
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and os.getpgid(children[0]) == os.getpgid(proc.pid):
+            time.sleep(0.05)
         assert os.getpgid(children[0]) != os.getpgid(proc.pid)
 
         command = kill_process_tree_command(cli_process_pattern(str(cli)), grace_seconds=1)
